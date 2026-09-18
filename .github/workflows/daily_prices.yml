@@ -1,0 +1,34 @@
+name: Daily prices and FX
+
+on:
+  schedule:
+    # 22:30 UTC, Monday to Friday (after the US close)
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      history_period:
+        description: "History period (5d for daily, 3y for one-time backfill)"
+        required: false
+        default: "5d"
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Load prices and FX
+        env:
+          ORDS_BASE: ${{ secrets.ORDS_BASE }}
+          ORDS_CLIENT_ID: ${{ secrets.ORDS_CLIENT_ID }}
+          ORDS_CLIENT_SECRET: ${{ secrets.ORDS_CLIENT_SECRET }}
+          HISTORY_PERIOD: ${{ github.event.inputs.history_period || '5d' }}
+        run: python load_prices.py

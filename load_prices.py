@@ -15,6 +15,9 @@ Environment variables (set as GitHub secrets):
   ORDS_CLIENT_ID
   ORDS_CLIENT_SECRET
   HISTORY_PERIOD       optional, default "5d". Use e.g. "3y" once for backfill.
+                       Securities with little history (need_history = Y from the
+                       database) always get FULL_HISTORY_PERIOD, so a new security
+                       has ATR from its first night.
 """
 
 import os
@@ -31,6 +34,7 @@ ORDS_BASE = os.environ["ORDS_BASE"].rstrip("/")
 CLIENT_ID = os.environ["ORDS_CLIENT_ID"]
 CLIENT_SECRET = os.environ["ORDS_CLIENT_SECRET"]
 PERIOD = os.environ.get("HISTORY_PERIOD", "5d") or "5d"
+FULL_HISTORY_PERIOD = "3y"
 
 DOWNLOAD_BATCH = 50      # tickers per yfinance download call
 POST_CHUNK_ROWS = 5000   # price rows per POST to the database
@@ -95,13 +99,13 @@ def frame_for(data, symbol, batch_size):
     return data[symbol]
 
 
-def download_prices(symbols):
+def download_prices(symbols, period):
     rows, failed = [], []
     for i in range(0, len(symbols), DOWNLOAD_BATCH):
         batch = symbols[i:i + DOWNLOAD_BATCH]
         data = yf.download(
             batch,
-            period=PERIOD,
+            period=period,
             interval="1d",
             group_by="ticker",
             auto_adjust=False,
@@ -169,7 +173,17 @@ def main():
     need_name = [s["yahoo_symbol"] for s in sym_rows if s.get("need_name") == "Y"]
     print(f"Symbols from database: {len(symbols)}; period: {PERIOD}")
 
-    rows, failed = download_prices(symbols)
+    need_history = [s["yahoo_symbol"] for s in sym_rows if s.get("need_history") == "Y"]
+    if PERIOD == FULL_HISTORY_PERIOD:
+        need_history = []
+    regular = [s for s in symbols if s not in set(need_history)]
+
+    rows, failed = download_prices(regular, PERIOD)
+    if need_history:
+        print(f"Full history ({FULL_HISTORY_PERIOD}) for {len(need_history)} symbols: {need_history}")
+        h_rows, h_failed = download_prices(need_history, FULL_HISTORY_PERIOD)
+        rows += h_rows
+        failed += h_failed
     print(f"Price rows: {len(rows)}; failed symbols: {failed}")
 
     if not rows:

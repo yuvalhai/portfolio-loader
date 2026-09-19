@@ -7,6 +7,8 @@ Flow:
   3. Download daily prices from Yahoo via yfinance, in batches.
   4. Send prices to the database (/loader/prices), in chunks.
   5. Read Bank of Israel representative rates and send them (/loader/fx).
+  6. For securities whose name did not come from Yahoo yet, read the name
+     from Yahoo and send it (/loader/names). Names always come from Yahoo.
 
 Environment variables (set as GitHub secrets):
   ORDS_BASE            e.g. https://<host>/ords/portfolio
@@ -144,10 +146,27 @@ def load_fx(token):
     return api_post(token, "fx", {"source": "BOI", "rates": rates})
 
 
+def fetch_names(symbols):
+    """Read the company name from Yahoo for each symbol. Failures are skipped."""
+    names = []
+    for sym in symbols:
+        try:
+            info = yf.Ticker(sym).get_info() or {}
+            name = info.get("longName") or info.get("shortName")
+            if name:
+                names.append({"yahoo_symbol": sym, "name": str(name).strip()})
+        except Exception as e:  # rate limit, unknown symbol, network
+            print(f"Name lookup failed for {sym}: {e}")
+        time.sleep(0.3)
+    return names
+
+
 def main():
     token = get_token()
 
-    symbols = [s["yahoo_symbol"] for s in api_get(token, "symbols")]
+    sym_rows = api_get(token, "symbols")
+    symbols = [s["yahoo_symbol"] for s in sym_rows]
+    need_name = [s["yahoo_symbol"] for s in sym_rows if s.get("need_name") == "Y"]
     print(f"Symbols from database: {len(symbols)}; period: {PERIOD}")
 
     rows, failed = download_prices(symbols)
@@ -169,6 +188,13 @@ def main():
         print(f"Posted {len(chunk)} rows: {res}")
 
     print("FX:", load_fx(token))
+
+    if need_name:
+        names = fetch_names(need_name)
+        print(f"Names found: {len(names)} of {len(need_name)}")
+        if names:
+            token = get_token()  # the price step may have taken long
+            print("Names:", api_post(token, "names", {"names": names}))
 
 
 if __name__ == "__main__":

@@ -151,14 +151,15 @@ def load_fx(token):
 
 
 def fetch_names(symbols):
-    """Read the company name from Yahoo for each symbol. Failures are skipped."""
+    """Read the company name and quote type (EQUITY / ETF) from Yahoo. Failures are skipped."""
     names = []
     for sym in symbols:
         try:
             info = yf.Ticker(sym).get_info() or {}
             name = info.get("longName") or info.get("shortName")
             if name:
-                names.append({"yahoo_symbol": sym, "name": str(name).strip()})
+                names.append({"yahoo_symbol": sym, "name": str(name).strip(),
+                              "quote_type": info.get("quoteType")})
         except Exception as e:  # rate limit, unknown symbol, network
             print(f"Name lookup failed for {sym}: {e}")
         time.sleep(0.3)

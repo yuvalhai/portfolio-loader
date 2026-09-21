@@ -1,0 +1,27 @@
+name: News loader
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"   # every 4 hours (UTC)
+  workflow_dispatch:
+
+# never two runs at once: each run rotates the TradingView refresh token
+concurrency:
+  group: news-loader
+  cancel-in-progress: false
+
+jobs:
+  news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements_news.txt
+      - run: python load_news.py
+        env:
+          ORDS_BASE: ${{ secrets.ORDS_BASE }}
+          ORDS_CLIENT_ID: ${{ secrets.ORDS_CLIENT_ID }}
+          ORDS_CLIENT_SECRET: ${{ secrets.ORDS_CLIENT_SECRET }}

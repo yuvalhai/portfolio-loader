@@ -223,6 +223,23 @@ class Gemini:
         self.model = sorted(good)[-1]
         log(f"Gemini model: {self.model}")
 
+    def switch_model(self):
+        """Move to another flash model (lite first) that was not tried yet. False when none is left."""
+        self.tried = getattr(self, "tried", set()) | {self.model}
+        r = self.client.get(f"{GEMINI_URL}/models")
+        if r.status_code != 200:
+            return False
+        names = [m["name"].split("/", 1)[-1] for m in r.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+        cands = [n for n in names if "flash" in n and n not in self.tried
+                 and not re.search(r"image|tts|live|audio|exp", n)]
+        if not cands:
+            return False
+        cands.sort(key=lambda n: (0 if "lite" in n else 1, n), reverse=False)
+        self.model = cands[0]
+        log(f"Gemini busy - switching to {self.model}")
+        return True
+
     def ask(self, instructions, item):
         body = {
             "system_instruction": {"parts": [{"text": instructions}]},
@@ -238,6 +255,8 @@ class Gemini:
             if r.status_code == 404 and attempt == 0:
                 self.pick_model()
                 continue
+            if r.status_code in (500, 503) and attempt >= 1 and self.switch_model():
+                continue          # model overloaded: try another flash model
             if r.status_code in (429, 500, 503):
                 if attempt == 3:
                     raise QuotaError(f"Gemini {r.status_code}: {r.text[:200]}")

@@ -27,7 +27,9 @@ TV_MCP_URL = "https://mcp.tradingview.com/mcp"
 TV_TOKEN_URL = "https://www.tradingview.com/mcp/oauth/token"
 PROVIDER = "TRADINGVIEW"
 
-FIRST_RUN_DAYS = 7            # look-back for a stock with no news in the DB yet
+FIRST_RUN_DAYS = 2            # look-back for a stock with no news in the DB yet
+HEAD_BUDGET_SEC = 15 * 60     # pass 1 (headlines for all stocks) must end by then
+RUN_BUDGET_SEC = 25 * 60      # pass 2 (story bodies) stops here; the rest waits for the next run
 OVERLAP_SEC = 86400           # re-read one day before the last known headline (duplicates are ignored by the DB)
 PAGE = 25
 MAX_HEADLINES = 200
@@ -192,73 +194,106 @@ def to_item(h):
 
 
 # ---------------- main ----------------
-async def process(ords, token, stocks, stats):
-    """Works through the queue; returns when done or when the access token needs renewal."""
+class Job:
+    """HEAD job: resolve TV symbol + load headlines for one stock. BODY job: story text of one headline."""
+    def __init__(self, kind, stock, news_id=None):
+        self.kind, self.stock, self.news_id = kind, stock, news_id
+
+
+def check(res, what):
+    if not isinstance(res, dict) or res.get("status") == "ERROR":
+        raise RuntimeError(f"{what}: {res}")
+    return res
+
+
+async def do_head(ords, tv, s, stats, bodies):
+    if not s.get("tv"):
+        s["tv"] = await tv.resolve(s["s"])
+        if not s["tv"]:
+            stats["failed"].append(f"{s['s']}: TV symbol not found")
+            return
+        check(ords.post("news/tv", {"id": s["id"], "tv": s["tv"]}), "news/tv")
+        stats["tv_filled"] += 1
+    items = [to_item(h) for h in await tv.headlines(s["tv"], s.get("since"))]
+    res = check(ords.post("news/load", {"id": s["id"], "items": items}), "news/load")
+    if (res.get("result") or {}).get("status") != "OK":
+        raise RuntimeError(f"news/load: {res}")
+    stats["headlines"] += len(items)
+    stats["new"] += res["result"].get("new", 0)
+    for nid in res.get("need_body") or []:
+        bodies.append(Job("BODY", s, nid))
+
+
+async def do_body(ords, tv, job, stats):
+    t1 = time.time()
+    text = await tv.story(job.news_id)
+    t2 = time.time()
+    check(ords.post("news/body", {"news_id": job.news_id, "text": text}), "news/body")
+    t3 = time.time()
+    stats["bodies"] += 1
+    stats["t_story"] += t2 - t1
+    stats["t_ords"] += t3 - t2
+    if stats["bodies"] <= 3 or stats["bodies"] % 25 == 0:
+        log(f"body {stats['bodies']} {job.stock['s']}: TradingView {t2 - t1:.1f}s, DB {t3 - t2:.1f}s")
+
+
+async def process(ords, token, queue, bodies, stats, deadline):
+    """Works through the queue; returns when done, out of time, or when the access token needs renewal."""
     headers = {"Authorization": f"Bearer {token.access_token}"}
     async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(60, read=300)) as client:
         async with streamable_http_client(TV_MCP_URL, http_client=client) as streams:
             async with ClientSession(streams[0], streams[1]) as session:
                 await session.initialize()
                 tv = Tv(session, [t.name for t in (await session.list_tools()).tools])
-                while stocks:
-                    if token.expiring():
+                while queue:
+                    if token.expiring() or time.time() > deadline:
                         return
-                    s = stocks[0]
+                    job = queue.pop(0)
                     try:
-                        if not s.get("tv"):
-                            s["tv"] = await tv.resolve(s["s"])
-                            if not s["tv"]:
-                                stats["failed"].append(f"{s['s']}: TV symbol not found")
-                                stocks.pop(0)
-                                continue
-                            ords.post("news/tv", {"id": s["id"], "tv": s["tv"]})
-                            stats["tv_filled"] += 1
-                        if "need_body" not in s:
-                            items = [to_item(h) for h in await tv.headlines(s["tv"], s.get("since"))]
-                            res = ords.post("news/load", {"id": s["id"], "items": items})
-                            if res.get("status") == "ERROR" or (res.get("result") or {}).get("status") != "OK":
-                                raise RuntimeError(f"load: {res}")
-                            stats["headlines"] += len(items)
-                            stats["new"] += res["result"].get("new", 0)
-                            s["need_body"] = list(res.get("need_body") or [])
-                        while s["need_body"]:
-                            if token.expiring():
-                                return
-                            nid = s["need_body"][0]
-                            try:
-                                text = await tv.story(nid)
-                                ords.post("news/body", {"news_id": nid, "text": text})
-                                stats["bodies"] += 1
-                            except Exception as e:  # one bad story must not stop the stock
-                                stats["failed"].append(f"{s['s']} body {nid}: {str(e)[:150]}")
-                            s["need_body"].pop(0)
+                        if job.kind == "HEAD":
+                            await do_head(ords, tv, job.stock, stats, bodies)
+                        else:
+                            await do_body(ords, tv, job, stats)
                     except Exception as e:
-                        stats["failed"].append(f"{s['s']}: {str(e)[:200]}")
-                    stocks.pop(0)
+                        what = job.stock["s"] + (f" body {job.news_id}" if job.news_id else "")
+                        stats["failed"].append(f"{what}: {str(e)[:200]}")
+
+
+def run_queue(ords, token, queue, bodies, stats, deadline):
+    while queue and time.time() < deadline:
+        if token.expiring():
+            token.refresh()
+        asyncio.run(process(ords, token, queue, bodies, stats, deadline))
 
 
 def main():
     t0 = time.time()
     ords = Ords()
-    stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "failed": []}
+    stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "failed": [], "t_story": 0.0, "t_ords": 0.0}
     status, message = "OK", ""
+    bodies = []
     try:
         token = TvToken(ords)
         token.refresh()
         stocks = ords.get("news/symbols")
         log(f"{len(stocks)} stocks")
-        while stocks:
-            if token.expiring():
-                token.refresh()
-            asyncio.run(process(ords, token, stocks, stats))
-            log(f"{len(stocks)} stocks left")
+        heads = [Job("HEAD", s) for s in stocks]
+        run_queue(ords, token, heads, bodies, stats, t0 + HEAD_BUDGET_SEC)
+        if heads:
+            message += f"Headlines not reached for {len(heads)} stocks (time budget). "
+        log(f"headlines done: {stats['headlines']} read, {stats['new']} new, {len(bodies)} bodies to fetch")
+        run_queue(ords, token, bodies, bodies, stats, t0 + RUN_BUDGET_SEC)
+        if bodies:
+            message += f"{len(bodies)} bodies left for the next run. "
     except SystemExit as e:
         status, message = "ERROR", str(e)
     except Exception as e:
         status, message = "ERROR", f"{type(e).__name__}: {str(e)[:500]}"
     if status == "OK" and stats["failed"]:
         status = "PARTIAL"
-    summary = (f"headlines {stats['headlines']}, new {stats['new']}, bodies {stats['bodies']}, "
+    n = max(stats["bodies"], 1)
+    summary = (f"headlines {stats['headlines']}, new {stats['new']}, bodies {stats['bodies']} "
+               f"(avg TradingView {stats['t_story'] / n:.1f}s, DB {stats['t_ords'] / n:.1f}s), "
                f"tv filled {stats['tv_filled']}, {int(time.time() - t0)}s. {message}").strip()
     log(f"{status}: {summary}")
     for f in stats["failed"]:

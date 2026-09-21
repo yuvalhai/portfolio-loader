@@ -1,0 +1,22 @@
+name: Granny Shots holdings
+
+on:
+  schedule:
+    - cron: "0 6 * * 6"   # Saturday 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  granny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install httpx
+      - run: python load_granny.py
+        env:
+          ORDS_BASE: ${{ secrets.ORDS_BASE }}
+          ORDS_CLIENT_ID: ${{ secrets.ORDS_CLIENT_ID }}
+          ORDS_CLIENT_SECRET: ${{ secrets.ORDS_CLIENT_SECRET }}

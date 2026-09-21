@@ -24,10 +24,27 @@ async def via_mcp(token):
                 tools = [x.name for x in (await session.list_tools()).tools]
                 print(f"MCP client: connect+initialize+list_tools {time.time() - t:.1f}s", flush=True)
                 name = next(x for x in tools if x.replace("-", "_").endswith("get_news"))
-                for i in range(3):
+                story = next(x for x in tools if x.replace("-", "_").endswith("get_news_story"))
+                search = next(x for x in tools if x.replace("-", "_").endswith("search_symbols"))
+
+                async def timed(label, tool, args):
                     t = time.time()
-                    await session.call_tool(name, {"symbol": SYMBOL, "limit": 5})
-                    print(f"MCP client: get_news #{i + 1} {time.time() - t:.1f}s", flush=True)
+                    res = await session.call_tool(tool, args)
+                    print(f"MCP client: {label} {time.time() - t:.1f}s", flush=True)
+                    return res
+
+                for i in range(3):
+                    await timed(f"get_news limit 5 #{i + 1}", name, {"symbol": SYMBOL, "limit": 5})
+                res = await timed("get_news limit 25 offset 0", name, {"symbol": SYMBOL, "limit": 25, "offset": 0})
+                first_id = json.loads("".join(getattr(c, "text", "") for c in res.content))["data"]["headlines"][0]["id"]
+                for sym in ["NASDAQ:MSFT", "NYSE:XOM", "NASDAQ:AMD"]:
+                    await timed(f"get_news limit 25 {sym}", name, {"symbol": sym, "limit": 25, "offset": 0})
+                await timed("get_news_story", story, {"id": first_id})
+                await timed("search_symbols", search, {"query": "ATROB", "type_filter": "stock"})
+                time.sleep(0.6)   # like a blocking database call inside the loop (load_news.py does this)
+                await timed("get_news after a blocking pause", name, {"symbol": SYMBOL, "limit": 25, "offset": 0})
+                time.sleep(0.6)
+                await timed("get_news_story after a blocking pause", story, {"id": first_id})
                 return name
 
 
@@ -63,7 +80,6 @@ def main():
     token.refresh()
     print(f"token refresh {time.time() - t:.1f}s", flush=True)
     name = asyncio.run(via_mcp(token))
-    via_raw(token, name)
     if not ln.GEMINI_API_KEY:
         print("GEMINI: GEMINI_API_KEY is not set in this workflow", flush=True)
     else:

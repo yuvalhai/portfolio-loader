@@ -44,7 +44,10 @@ US_EXCHANGES = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"]
 
 # stage 3 by Gemini (skipped when GEMINI_API_KEY is not set)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-flash-latest"
+# models that answered on the free tier (probe 21/09/2026), best first; override with GEMINI_MODELS="a,b,c"
+GEMINI_MODELS = [m.strip() for m in (os.environ.get("GEMINI_MODELS") or
+                 "gemini-3-flash-preview,gemini-flash-latest,gemini-3.1-flash-lite,"
+                 "gemini-flash-lite-latest,gemma-4-26b-a4b-it").split(",") if m.strip()]
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 AI_BATCH = 50                 # items per queue request
 AI_BUDGET_SEC = 12 * 60       # stage 3 time budget per run
@@ -216,74 +219,65 @@ def to_item(h):
 
 # ---------------- stage 3: Gemini ----------------
 class Gemini:
+    """Tries the models of GEMINI_MODELS in order. Busy (503) -> next model for this item;
+    no quota (429) or not available (404) -> that model is skipped for the rest of the run."""
+
     def __init__(self):
         self.client = httpx.Client(timeout=120, headers={"x-goog-api-key": GEMINI_API_KEY})
-        self.model = GEMINI_MODEL
+        self.models = list(GEMINI_MODELS)
+        self.dead = set()
+        self.model = self.models[0]
         self.last = 0.0
 
-    def pick_model(self):
-        """Fallback when the configured model name is unknown: newest-looking flash model that can generate."""
-        r = self.client.get(f"{GEMINI_URL}/models")
-        r.raise_for_status()
-        names = [m["name"].split("/", 1)[-1] for m in r.json().get("models", [])
-                 if "generateContent" in m.get("supportedGenerationMethods", [])]
-        good = [n for n in names if "flash" in n and not re.search(r"lite|image|tts|live|audio|thinking|exp", n)]
-        if not good:
-            raise RuntimeError(f"No Gemini flash model found in {names[:20]}")
-        self.model = sorted(good)[-1]
-        log(f"Gemini model: {self.model}")
+    def _body(self, model, instructions, item):
+        text = json.dumps(item, ensure_ascii=False)
+        if model.startswith("gemma"):   # Gemma: no system instruction and no JSON mode
+            return {"contents": [{"role": "user", "parts": [{"text": instructions + "\n\nINPUT:\n" + text
+                                                             + "\n\nAnswer with the JSON object only."}]}],
+                    "generationConfig": {"temperature": 0.2}}
+        return {"system_instruction": {"parts": [{"text": instructions}]},
+                "contents": [{"role": "user", "parts": [{"text": text}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
 
-    def switch_model(self):
-        """Move to another flash model (lite first) that was not tried yet. False when none is left."""
-        self.tried = getattr(self, "tried", set()) | {self.model}
-        r = self.client.get(f"{GEMINI_URL}/models")
-        if r.status_code != 200:
-            return False
-        names = [m["name"].split("/", 1)[-1] for m in r.json().get("models", [])
-                 if "generateContent" in m.get("supportedGenerationMethods", [])]
-        cands = [n for n in names if "flash" in n and n not in self.tried
-                 and not re.search(r"image|tts|live|audio|exp", n)]
-        if not cands:
-            return False
-        cands.sort(key=lambda n: (0 if "lite" in n else 1, n), reverse=False)
-        self.model = cands[0]
-        log(f"Gemini busy - switching to {self.model}")
-        return True
+    @staticmethod
+    def _parse(data):
+        text = "".join(p.get("text", "") for c in data.get("candidates", [])[:1]
+                       for p in c.get("content", {}).get("parts", []))
+        m = re.search(r"\{.*\}", text, re.S)
+        res = json.loads(m.group(0) if m else text)
+        if isinstance(res, list):
+            res = res[0]
+        if str(res.get("decision", "")).upper() not in DECISIONS:
+            raise RuntimeError(f"bad decision: {text[:200]}")
+        return res
 
     def ask(self, instructions, item):
-        body = {
-            "system_instruction": {"parts": [{"text": instructions}]},
-            "contents": [{"role": "user", "parts": [{"text": json.dumps(item, ensure_ascii=False)}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
-        }
-        for attempt in range(4):
-            wait = AI_CALL_GAP - (time.time() - self.last)
-            if wait > 0:
-                time.sleep(wait)
-            self.last = time.time()
-            r = self.client.post(f"{GEMINI_URL}/models/{self.model}:generateContent", json=body)
-            if r.status_code == 404 and attempt == 0:
-                self.pick_model()
-                continue
-            if r.status_code in (500, 503) and attempt >= 1 and self.switch_model():
-                continue          # model overloaded: try another flash model
-            if r.status_code in (429, 500, 503):
-                if attempt == 3:
-                    raise QuotaError(f"Gemini {r.status_code}: {r.text[:200]}")
-                time.sleep(20 * (attempt + 1))
-                continue
-            r.raise_for_status()
-            data = r.json()
-            text = "".join(p.get("text", "") for c in data.get("candidates", [])[:1]
-                           for p in c.get("content", {}).get("parts", []))
-            text = re.sub(r"^```(json)?|```$", "", text.strip()).strip()
-            res = json.loads(text)
-            if isinstance(res, list):
-                res = res[0]
-            if str(res.get("decision", "")).upper() not in DECISIONS:
-                raise RuntimeError(f"bad decision: {text[:200]}")
-            return res
-        raise RuntimeError("Gemini: no answer")
+        errors = []
+        for model in [m for m in self.models if m not in self.dead]:
+            for attempt in range(2):
+                wait = AI_CALL_GAP - (time.time() - self.last)
+                if wait > 0:
+                    time.sleep(wait)
+                self.last = time.time()
+                r = self.client.post(f"{GEMINI_URL}/models/{model}:generateContent",
+                                     json=self._body(model, instructions, item))
+                if r.status_code == 200:
+                    if model != self.model:
+                        log(f"Gemini model now: {model}")
+                        self.model = model
+                    return self._parse(r.json())
+                errors.append(f"{model} {r.status_code}")
+                if r.status_code in (404, 429):
+                    self.dead.add(model)
+                    log(f"Gemini {model}: {r.status_code} - skipped for this run")
+                    break
+                if r.status_code in (500, 503) and attempt == 0:
+                    time.sleep(5)
+                    continue
+                if r.status_code in (500, 503):
+                    break
+                r.raise_for_status()
+        raise QuotaError("no Gemini model answered: " + ", ".join(errors[-6:]))
 
 
 class QuotaError(Exception):

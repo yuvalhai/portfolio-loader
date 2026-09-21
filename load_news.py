@@ -28,9 +28,10 @@ TV_MCP_URL = "https://mcp.tradingview.com/mcp"
 TV_TOKEN_URL = "https://www.tradingview.com/mcp/oauth/token"
 PROVIDER = "TRADINGVIEW"
 
+STOCKS_PER_RUN = 50           # rotation: each run takes the stocks scanned longest ago (held first)
 FIRST_RUN_DAYS = 2            # look-back for a stock with no news in the DB yet
-HEAD_BUDGET_SEC = 15 * 60     # pass 1 (headlines for all stocks) must end by then
-RUN_BUDGET_SEC = 25 * 60      # pass 2 (story bodies) stops here; the rest waits for the next run
+HEAD_BUDGET_SEC = 15 * 60     # safety net only: pass 1 (headlines) must end by then
+RUN_BUDGET_SEC = 25 * 60      # safety net only: pass 2 (story bodies) stops here; the rest waits for the next run
 OVERLAP_SEC = 86400           # re-read one day before the last known headline (duplicates are ignored by the DB)
 PAGE = 25
 MAX_HEADLINES = 200
@@ -370,7 +371,7 @@ def main():
     try:
         token = TvToken(ords)
         token.refresh()
-        stocks = ords.get("news/symbols")
+        stocks = ords.get(f"news/symbols?limit={STOCKS_PER_RUN}")
         log(f"{len(stocks)} stocks")
         heads = [Job("HEAD", s) for s in stocks]
         run_queue(ords, token, heads, bodies, stats, t0 + HEAD_BUDGET_SEC)

@@ -38,6 +38,7 @@ PAGE = 25
 MAX_HEADLINES = 200
 MIN_CALL_GAP = 0.7            # TradingView limit is ~100 calls/minute
 WORKERS = 6                   # TradingView calls in flight at the same time
+MAX_RECONNECTS = 5            # a broken TradingView connection is reopened this many times per run
 SESSION_MAX_SEC = 12 * 60     # access token lives 15 minutes; renew before that
 US_EXCHANGES = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"]
 
@@ -388,11 +389,29 @@ async def process(ords, token, queue, bodies, stats, deadline):
                 await asyncio.gather(*(worker() for _ in range(WORKERS)))
 
 
+def leaf_errors(e):
+    """Readable text of an exception, unwrapping exception groups (the MCP transport raises those)."""
+    if isinstance(e, BaseExceptionGroup):
+        return "; ".join(leaf_errors(x) for x in e.exceptions)
+    return f"{type(e).__name__}: {str(e)[:200]}"
+
+
 def run_queue(ords, token, queue, bodies, stats, deadline):
+    """Runs the queue; when the TradingView connection breaks, reconnects and continues (up to MAX_RECONNECTS)."""
+    breaks = 0
     while queue and time.time() < deadline:
         if token.expiring():
             token.refresh()
-        asyncio.run(process(ords, token, queue, bodies, stats, deadline))
+        try:
+            asyncio.run(process(ords, token, queue, bodies, stats, deadline))
+        except Exception as e:
+            breaks += 1
+            err = leaf_errors(e)
+            log(f"TradingView connection broke ({breaks}): {err}")
+            stats["failed"].append(f"connection break: {err}")
+            if breaks >= MAX_RECONNECTS:
+                raise RuntimeError(f"TradingView connection broke {breaks} times; last: {err}")
+            time.sleep(10)
 
 
 def main():
@@ -418,7 +437,7 @@ def main():
     except SystemExit as e:
         status, message = "ERROR", str(e)
     except Exception as e:
-        status, message = "ERROR", f"{type(e).__name__}: {str(e)[:500]}"
+        status, message = "ERROR", leaf_errors(e)[:500]
     if status == "OK" and stats["failed"]:
         status = "PARTIAL"
     n = max(stats["bodies"], 1)

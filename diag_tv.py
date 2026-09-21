@@ -5,6 +5,7 @@ Uses (and safely rotates) the token stored in the DB, like load_news.py.
 """
 import asyncio
 import json
+import re
 import time
 
 import httpx
@@ -73,21 +74,30 @@ def via_raw(token, tool_name):
               f"bytes {len(r.content)}", flush=True)
 
 
+def gemini_probe():
+    """Which Gemini models answer on this key (free tier)? One tiny request per candidate model."""
+    g = ln.Gemini()
+    r = g.client.get(f"{ln.GEMINI_URL}/models")
+    names = [m["name"].split("/", 1)[-1] for m in r.json().get("models", [])
+             if "generateContent" in m.get("supportedGenerationMethods", [])]
+    print("GEMINI models with generateContent:", ", ".join(names), flush=True)
+    body = {"contents": [{"role": "user", "parts": [{"text": 'Answer with JSON {"ok":true}'}]}],
+            "generationConfig": {"responseMimeType": "application/json"}}
+    for n in names:
+        if not re.search(r"flash|gemma|pro", n) or re.search(r"image|tts|live|audio|embedding", n):
+            continue
+        t = time.time()
+        x = g.client.post(f"{ln.GEMINI_URL}/models/{n}:generateContent", json=body)
+        msg = "" if x.status_code == 200 else x.json().get("error", {}).get("message", x.text)[:120]
+        print(f"GEMINI {n}: {x.status_code} {time.time() - t:.1f}s {msg}", flush=True)
+        time.sleep(2)
+
+
 def main():
-    ords = ln.Ords()
-    token = ln.TvToken(ords)
-    t = time.time()
-    token.refresh()
-    print(f"token refresh {time.time() - t:.1f}s", flush=True)
-    name = asyncio.run(via_mcp(token))
     if not ln.GEMINI_API_KEY:
         print("GEMINI: GEMINI_API_KEY is not set in this workflow", flush=True)
-    else:
-        g = ln.Gemini()
-        t = time.time()
-        r = g.client.get(f"{ln.GEMINI_URL}/models")
-        print(f"GEMINI: list models {time.time() - t:.1f}s status {r.status_code} {r.text[:200] if r.status_code != 200 else ''}",
-              flush=True)
+        return
+    gemini_probe()
 
 
 if __name__ == "__main__":

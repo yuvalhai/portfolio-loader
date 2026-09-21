@@ -6,7 +6,8 @@ Portfolio news loader (GitHub Actions).
    TradingView MCP server and loads them to PF_NEWS_INBOX (stage 1, title rules run in the DB).
 4. For headlines still KEEP/REVIEW without a body: pulls the story text and runs stage 2 (body rules).
 5. Logs the run to PF_LOAD_RUN (RUN_TYPE NEWS).
-Secrets: ORDS_BASE, ORDS_CLIENT_ID, ORDS_CLIENT_SECRET
+6. Stage 3: sends each KEEP/REVIEW item with a body to Gemini and stores its proposal in PF_NEWS_AI (Claude reviews).
+Secrets: ORDS_BASE, ORDS_CLIENT_ID, ORDS_CLIENT_SECRET, GEMINI_API_KEY (optional)
 """
 import asyncio
 import json
@@ -36,6 +37,15 @@ MAX_HEADLINES = 200
 MIN_CALL_GAP = 0.7            # TradingView limit is ~100 calls/minute
 SESSION_MAX_SEC = 12 * 60     # access token lives 15 minutes; renew before that
 US_EXCHANGES = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"]
+
+# stage 3 by Gemini (skipped when GEMINI_API_KEY is not set)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-flash-latest"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
+AI_BATCH = 50                 # items per queue request
+AI_BUDGET_SEC = 12 * 60       # stage 3 time budget per run
+AI_CALL_GAP = 4.5             # stay well under the free-tier requests-per-minute limit
+DECISIONS = {"NEW_CATALYST", "CONFIRMS", "REFUTES", "STANDALONE", "DISCARD", "ASK"}
 
 
 def log(msg):
@@ -193,6 +203,91 @@ def to_item(h):
     }
 
 
+# ---------------- stage 3: Gemini ----------------
+class Gemini:
+    def __init__(self):
+        self.client = httpx.Client(timeout=120, headers={"x-goog-api-key": GEMINI_API_KEY})
+        self.model = GEMINI_MODEL
+        self.last = 0.0
+
+    def pick_model(self):
+        """Fallback when the configured model name is unknown: newest-looking flash model that can generate."""
+        r = self.client.get(f"{GEMINI_URL}/models")
+        r.raise_for_status()
+        names = [m["name"].split("/", 1)[-1] for m in r.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+        good = [n for n in names if "flash" in n and not re.search(r"lite|image|tts|live|audio|thinking|exp", n)]
+        if not good:
+            raise RuntimeError(f"No Gemini flash model found in {names[:20]}")
+        self.model = sorted(good)[-1]
+        log(f"Gemini model: {self.model}")
+
+    def ask(self, instructions, item):
+        body = {
+            "system_instruction": {"parts": [{"text": instructions}]},
+            "contents": [{"role": "user", "parts": [{"text": json.dumps(item, ensure_ascii=False)}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
+        }
+        for attempt in range(4):
+            wait = AI_CALL_GAP - (time.time() - self.last)
+            if wait > 0:
+                time.sleep(wait)
+            self.last = time.time()
+            r = self.client.post(f"{GEMINI_URL}/models/{self.model}:generateContent", json=body)
+            if r.status_code == 404 and attempt == 0:
+                self.pick_model()
+                continue
+            if r.status_code in (429, 500, 503):
+                if attempt == 3:
+                    raise QuotaError(f"Gemini {r.status_code}: {r.text[:200]}")
+                time.sleep(20 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            data = r.json()
+            text = "".join(p.get("text", "") for c in data.get("candidates", [])[:1]
+                           for p in c.get("content", {}).get("parts", []))
+            text = re.sub(r"^```(json)?|```$", "", text.strip()).strip()
+            res = json.loads(text)
+            if isinstance(res, list):
+                res = res[0]
+            if str(res.get("decision", "")).upper() not in DECISIONS:
+                raise RuntimeError(f"bad decision: {text[:200]}")
+            return res
+        raise RuntimeError("Gemini: no answer")
+
+
+class QuotaError(Exception):
+    pass
+
+
+def run_ai(ords, stats, deadline):
+    if not GEMINI_API_KEY:
+        log("GEMINI_API_KEY not set - stage 3 skipped")
+        return
+    gem = Gemini()
+    done_ids = set()
+    while time.time() < deadline:
+        q = ords.get(f"news/ai_queue?limit={AI_BATCH}")
+        items = [i for i in q.get("items") or [] if i["inbox_id"] not in done_ids]
+        if not items:
+            break
+        for item in items:
+            if time.time() > deadline:
+                break
+            done_ids.add(item["inbox_id"])
+            try:
+                res = gem.ask(q["instructions"], item)
+                check(ords.post("news/ai_result", {"inbox_id": item["inbox_id"], "model": gem.model, "result": res}),
+                      "news/ai_result")
+                stats["ai"] += 1
+            except QuotaError as e:
+                stats["failed"].append(f"AI stopped: {e}")
+                return
+            except Exception as e:
+                stats["failed"].append(f"AI {item.get('symbol')} {item['inbox_id']}: {str(e)[:150]}")
+    log(f"stage 3: {stats['ai']} items decided by {gem.model}")
+
+
 # ---------------- main ----------------
 class Job:
     """HEAD job: resolve TV symbol + load headlines for one stock. BODY job: story text of one headline."""
@@ -269,7 +364,7 @@ def run_queue(ords, token, queue, bodies, stats, deadline):
 def main():
     t0 = time.time()
     ords = Ords()
-    stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "failed": [], "t_story": 0.0, "t_ords": 0.0}
+    stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "failed": [], "t_story": 0.0, "t_ords": 0.0, "ai": 0}
     status, message = "OK", ""
     bodies = []
     try:
@@ -285,6 +380,7 @@ def main():
         run_queue(ords, token, bodies, bodies, stats, t0 + RUN_BUDGET_SEC)
         if bodies:
             message += f"{len(bodies)} bodies left for the next run. "
+        run_ai(ords, stats, time.time() + AI_BUDGET_SEC)
     except SystemExit as e:
         status, message = "ERROR", str(e)
     except Exception as e:
@@ -294,7 +390,7 @@ def main():
     n = max(stats["bodies"], 1)
     summary = (f"headlines {stats['headlines']}, new {stats['new']}, bodies {stats['bodies']} "
                f"(avg TradingView {stats['t_story'] / n:.1f}s, DB {stats['t_ords'] / n:.1f}s), "
-               f"tv filled {stats['tv_filled']}, {int(time.time() - t0)}s. {message}").strip()
+               f"tv filled {stats['tv_filled']}, AI decided {stats['ai']}, {int(time.time() - t0)}s. {message}").strip()
     log(f"{status}: {summary}")
     for f in stats["failed"]:
         log("FAILED " + f)

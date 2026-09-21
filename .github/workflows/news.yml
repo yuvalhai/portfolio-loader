@@ -13,7 +13,7 @@ concurrency:
 jobs:
   news:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,3 +25,4 @@ jobs:
           ORDS_BASE: ${{ secrets.ORDS_BASE }}
           ORDS_CLIENT_ID: ${{ secrets.ORDS_CLIENT_ID }}
           ORDS_CLIENT_SECRET: ${{ secrets.ORDS_CLIENT_SECRET }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

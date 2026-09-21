@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 
 import httpx
@@ -36,6 +37,7 @@ OVERLAP_SEC = 86400           # re-read one day before the last known headline (
 PAGE = 25
 MAX_HEADLINES = 200
 MIN_CALL_GAP = 0.7            # TradingView limit is ~100 calls/minute
+WORKERS = 6                   # TradingView calls in flight at the same time
 SESSION_MAX_SEC = 12 * 60     # access token lives 15 minutes; renew before that
 US_EXCHANGES = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"]
 
@@ -57,6 +59,7 @@ def log(msg):
 class Ords:
     def __init__(self):
         self.client = httpx.Client(timeout=120)
+        self.lock = threading.Lock()
         r = self.client.post(f"{ORDS_BASE}/oauth/token", data={"grant_type": "client_credentials"},
                              auth=(ORDS_CLIENT_ID, ORDS_CLIENT_SECRET))
         r.raise_for_status()
@@ -68,6 +71,10 @@ class Ords:
         return r.json()
 
     def post(self, path, body):
+        with self.lock:   # called from several worker threads
+            return self._post(path, body)
+
+    def _post(self, path, body):
         r = self.client.post(f"{ORDS_BASE}/loader/{path}", content=json.dumps(body),
                              headers={"Content-Type": "application/json"})
         r.raise_for_status()
@@ -147,6 +154,7 @@ class Tv:
         self.session = session
         self.tools = tools
         self.last = 0.0
+        self.lock = asyncio.Lock()
 
     def tool(self, suffix):
         name = next((t for t in self.tools if t.replace("-", "_").endswith(suffix)), None)
@@ -155,10 +163,11 @@ class Tv:
         return name
 
     async def call(self, suffix, args):
-        wait = MIN_CALL_GAP - (time.time() - self.last)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self.last = time.time()
+        async with self.lock:                      # start calls at most every MIN_CALL_GAP seconds (all workers)
+            wait = MIN_CALL_GAP - (time.time() - self.last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self.last = time.time()
         res = await self.session.call_tool(self.tool(suffix), args)
         text = "".join(getattr(c, "text", "") for c in res.content)
         if res.isError:
@@ -327,10 +336,10 @@ async def do_head(ords, tv, s, stats, bodies):
         if not s["tv"]:
             stats["failed"].append(f"{s['s']}: TV symbol not found")
             return
-        check(ords.post("news/tv", {"id": s["id"], "tv": s["tv"]}), "news/tv")
+        check(await asyncio.to_thread(ords.post, "news/tv", {"id": s["id"], "tv": s["tv"]}), "news/tv")
         stats["tv_filled"] += 1
     items = [to_item(h) for h in await tv.headlines(s["tv"], s.get("since"))]
-    res = check(ords.post("news/load", {"id": s["id"], "items": items}), "news/load")
+    res = check(await asyncio.to_thread(ords.post, "news/load", {"id": s["id"], "items": items}), "news/load")
     if (res.get("result") or {}).get("status") != "OK":
         raise RuntimeError(f"news/load: {res}")
     stats["headlines"] += len(items)
@@ -343,7 +352,7 @@ async def do_body(ords, tv, job, stats):
     t1 = time.time()
     text = await tv.story(job.news_id)
     t2 = time.time()
-    check(ords.post("news/body", {"news_id": job.news_id, "text": text}), "news/body")
+    check(await asyncio.to_thread(ords.post, "news/body", {"news_id": job.news_id, "text": text}), "news/body")
     t3 = time.time()
     stats["bodies"] += 1
     stats["t_story"] += t2 - t1
@@ -360,18 +369,23 @@ async def process(ords, token, queue, bodies, stats, deadline):
             async with ClientSession(streams[0], streams[1]) as session:
                 await session.initialize()
                 tv = Tv(session, [t.name for t in (await session.list_tools()).tools])
-                while queue:
-                    if token.expiring() or time.time() > deadline:
-                        return
-                    job = queue.pop(0)
-                    try:
-                        if job.kind == "HEAD":
-                            await do_head(ords, tv, job.stock, stats, bodies)
-                        else:
-                            await do_body(ords, tv, job, stats)
-                    except Exception as e:
-                        what = job.stock["s"] + (f" body {job.news_id}" if job.news_id else "")
-                        stats["failed"].append(f"{what}: {str(e)[:200]}")
+
+                async def worker():
+                    while queue:
+                        if token.expiring() or time.time() > deadline:
+                            return
+                        job = queue.pop(0)
+                        try:
+                            if job.kind == "HEAD":
+                                await do_head(ords, tv, job.stock, stats, bodies)
+                            else:
+                                await do_body(ords, tv, job, stats)
+                        except Exception as e:
+                            what = job.stock["s"] + (f" body {job.news_id}" if job.news_id else "")
+                            stats["failed"].append(f"{what}: {str(e)[:200]}")
+
+                # TradingView answers slowly at times (up to ~30 s per call); several calls in flight keep the pace
+                await asyncio.gather(*(worker() for _ in range(WORKERS)))
 
 
 def run_queue(ords, token, queue, bodies, stats, deadline):

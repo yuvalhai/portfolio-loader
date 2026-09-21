@@ -1,0 +1,25 @@
+name: TradingView diagnostic
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: news-loader
+  cancel-in-progress: false
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements_news.txt
+      - run: python diag_tv.py
+        env:
+          ORDS_BASE: ${{ secrets.ORDS_BASE }}
+          ORDS_CLIENT_ID: ${{ secrets.ORDS_CLIENT_ID }}
+          ORDS_CLIENT_SECRET: ${{ secrets.ORDS_CLIENT_SECRET }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

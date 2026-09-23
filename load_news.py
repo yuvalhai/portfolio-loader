@@ -20,6 +20,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 
 import httpx
 from mcp.client.session import ClientSession
@@ -62,6 +63,7 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 AI_BATCH = 50                 # items per queue request
 AI_BUDGET_SEC = 12 * 60       # stage 3 time budget per run, both tiers together
 AI_DEEP_MAX_SEC = 6 * 60      # DEEP may use at most this much of it, so LIGHT always gets a turn
+AI_WORKERS = 4                # items asked at once; AI_CALL_GAP still spaces the call starts (~13 per minute at most)
 AI_BUSY_PAUSE_SEC = 30        # all models of a tier busy on an item -> skip it and wait this long
 AI_BUSY_STOP = 3              # ...and stop the tier after this many such items in a row
 AI_CALL_GAP = 4.5             # stay well under the free-tier requests-per-minute limit
@@ -241,6 +243,7 @@ class Gemini:
         self.dead = set()
         self.model = self.models[0]
         self.last = 0.0
+        self.gap_lock = threading.Lock()   # several items are asked at once; calls still start AI_CALL_GAP apart
 
     def _body(self, model, instructions, item):
         text = json.dumps(item, ensure_ascii=False)
@@ -270,10 +273,13 @@ class Gemini:
         errors = []
         for model in [m for m in self.models if m not in self.dead]:
             for attempt in range(2):
-                wait = AI_CALL_GAP - (time.time() - self.last)
-                if wait > 0:
-                    time.sleep(wait)
-                self.last = time.time()
+                if model in self.dead:          # another item may have found it out of quota meanwhile
+                    break
+                with self.gap_lock:
+                    wait = AI_CALL_GAP - (time.time() - self.last)
+                    if wait > 0:
+                        time.sleep(wait)
+                    self.last = time.time()
                 r = self.client.post(f"{GEMINI_URL}/models/{model}:generateContent",
                                      json=self._body(model, instructions, item))
                 if r.status_code == 200:
@@ -296,7 +302,7 @@ class Gemini:
                 r.raise_for_status()
         # every model is out of quota or missing -> nothing more this run; otherwise some were only busy
         if all(m in self.dead for m in self.models):
-            raise QuotaError("no Gemini model answered: " + ", ".join(errors[-6:]))
+            raise QuotaError("no Gemini model answered: " + (", ".join(errors[-6:]) or "all out of quota"))
         raise BusyError("all Gemini models busy: " + ", ".join(errors[-6:]))
 
 
@@ -320,49 +326,65 @@ def run_ai(ords, stats, deadline, tier, models):
     done_ids = set()
     n = 0
     busy_streak = 0
-    while time.time() < deadline:
-        q = ords.get(f"news/ai_queue?limit={AI_BATCH}&tier={tier}")
-        items = [i for i in q.get("items") or [] if i["inbox_id"] not in done_ids]
-        if not items:
-            break
-        for item in items:
-            if time.time() > deadline:
-                break
-            done_ids.add(item["inbox_id"])
-            try:
-                res = gem.ask(q["instructions"], item)
-                busy_streak = 0
-                check(ords.post("news/ai_result", {"inbox_id": item["inbox_id"], "model": gem.model,
-                                                   "tier": tier, "result": res}), "news/ai_result")
-                n += 1
-                stats["ai"] += 1
-                stats["ai_" + tier.lower()] += 1
-                if not res["body_he"]:
-                    stats["no_summary"] += 1
-                if tier == "LIGHT" and str(res.get("decision", "")).upper() not in ("DISCARD", "ANALYST"):
-                    stats["escalated"] += 1
-            except QuotaError as e:
-                if tier == "DEEP":
-                    # expected: the good models' daily free quota is small; their queue waits for a later run
-                    stats["notes"].append("DEEP quota used up, the rest waits")
-                    log(f"stage 3 {tier}: quota used up - {e}")
-                else:
-                    stats["failed"].append(f"AI {tier} stopped: {e}")
-                break
-            except BusyError as e:
-                # a busy spell at Google is temporary: the item stays in the queue for a later run
-                busy_streak += 1
-                stats["busy_skipped"] += 1
-                log(f"stage 3 {tier}: item {item['inbox_id']} skipped, models busy ({busy_streak} in a row)")
-                if busy_streak >= AI_BUSY_STOP:
-                    stats["failed"].append(f"AI {tier} stopped: models busy on {busy_streak} items in a row")
+    stop = False
+    # Most of the time per item is waiting for Gemini to write its answer, far below the per-minute
+    # limit, so AI_WORKERS items are asked at once. Results are written to the DB here, one at a time.
+    with ThreadPoolExecutor(AI_WORKERS) as pool:
+        while not stop and time.time() < deadline:
+            q = ords.get(f"news/ai_queue?limit={AI_BATCH}&tier={tier}")
+            items = iter([i for i in q.get("items") or [] if i["inbox_id"] not in done_ids])
+            pending = set()
+            fetched_any = False
+            while True:
+                while not stop and len(pending) < AI_WORKERS and time.time() < deadline:
+                    item = next(items, None)
+                    if item is None:
+                        break
+                    fetched_any = True
+                    done_ids.add(item["inbox_id"])
+                    f = pool.submit(gem.ask, q["instructions"], item)
+                    f.item = item
+                    pending.add(f)
+                if not pending:
                     break
-                time.sleep(AI_BUSY_PAUSE_SEC)
-            except Exception as e:
-                stats["failed"].append(f"AI {tier} {item.get('symbol')} {item['inbox_id']}: {str(e)[:150]}")
-        else:
-            continue
-        break
+                finished, pending = wait_futures(pending, return_when=FIRST_COMPLETED)
+                for f in finished:
+                    item = f.item
+                    try:
+                        res = f.result()
+                        busy_streak = 0
+                        check(ords.post("news/ai_result", {"inbox_id": item["inbox_id"], "model": gem.model,
+                                                           "tier": tier, "result": res}), "news/ai_result")
+                        n += 1
+                        stats["ai"] += 1
+                        stats["ai_" + tier.lower()] += 1
+                        if not res["body_he"]:
+                            stats["no_summary"] += 1
+                        if tier == "LIGHT" and str(res.get("decision", "")).upper() not in ("DISCARD", "ANALYST"):
+                            stats["escalated"] += 1
+                    except QuotaError as e:
+                        if not stop:
+                            if tier == "DEEP":
+                                # expected: the good models' daily free quota is small; their queue waits
+                                stats["notes"].append("DEEP quota used up, the rest waits")
+                                log(f"stage 3 {tier}: quota used up - {e}")
+                            else:
+                                stats["failed"].append(f"AI {tier} stopped: {e}")
+                        stop = True
+                    except BusyError:
+                        # a busy spell at Google is temporary: the item stays in the queue for a later run
+                        busy_streak += 1
+                        stats["busy_skipped"] += 1
+                        log(f"stage 3 {tier}: item {item['inbox_id']} skipped, models busy ({busy_streak} in a row)")
+                        if busy_streak >= AI_BUSY_STOP and not stop:
+                            stats["failed"].append(f"AI {tier} stopped: models busy on {busy_streak} items in a row")
+                            stop = True
+                        elif not stop:
+                            time.sleep(AI_BUSY_PAUSE_SEC)
+                    except Exception as e:
+                        stats["failed"].append(f"AI {tier} {item.get('symbol')} {item['inbox_id']}: {str(e)[:150]}")
+            if not fetched_any:
+                break
     log(f"stage 3 {tier}: {n} items decided, last model {gem.model}")
 
 

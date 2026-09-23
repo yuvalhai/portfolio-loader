@@ -1,0 +1,29 @@
+name: keepalive
+
+# GitHub disables every scheduled workflow of a PUBLIC repository after 60 days with no activity
+# in the repository. This commits a one-line date file twice a month, which counts as activity,
+# so news, prices, ARK and the rest keep running even when nobody touches the repository.
+
+on:
+  schedule:
+    - cron: "17 3 1,15 * *"   # 03:17 UTC on the 1st and 15th: one missed run still leaves a margin
+  workflow_dispatch:           # run it once by hand after uploading, to check it works
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Commit the date
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git commit -m "keepalive $(date -u +%Y-%m-%d)"
+          git push

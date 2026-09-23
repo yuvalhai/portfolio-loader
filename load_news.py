@@ -54,7 +54,7 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 AI_BATCH = 50                 # items per queue request
 AI_BUDGET_SEC = 12 * 60       # stage 3 time budget per run
 AI_CALL_GAP = 4.5             # stay well under the free-tier requests-per-minute limit
-DECISIONS = {"NEW_CATALYST", "CONFIRMS", "REFUTES", "STANDALONE", "DISCARD", "ASK"}
+DECISIONS = {"NEW_CATALYST", "CONFIRMS", "REFUTES", "STANDALONE", "ANALYST", "DISCARD", "ASK"}
 
 
 def log(msg):

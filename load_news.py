@@ -8,7 +8,9 @@ Portfolio news loader (GitHub Actions).
 5. Logs the run to PF_LOAD_RUN (RUN_TYPE NEWS).
 6. Stage 3: sends each KEEP/REVIEW item with a body to Gemini and stores its proposal in PF_NEWS_AI,
    together with a Hebrew factual summary of the story (body_he) that the external auditor reads
-   instead of the full story, because the MCP connector truncates anything over 4000 chars.
+   instead of the full story, because the MCP connector truncates anything over 4000 bytes.
+   Two tiers, newest first: DEEP (good models, first) on the categories that need understanding and on
+   escalations; LIGHT (cheap models) on the rest. A LIGHT decision other than DISCARD/ANALYST escalates.
 Secrets: ORDS_BASE, ORDS_CLIENT_ID, ORDS_CLIENT_SECRET, GEMINI_API_KEY (optional)
 """
 import asyncio
@@ -46,13 +48,20 @@ US_EXCHANGES = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"]
 
 # stage 3 by Gemini (skipped when GEMINI_API_KEY is not set)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-# models that answered on the free tier (probe 21/09/2026), best first; override with GEMINI_MODELS="a,b,c"
-GEMINI_MODELS = [m.strip() for m in (os.environ.get("GEMINI_MODELS") or
-                 "gemini-3-flash-preview,gemini-flash-latest,gemini-3.1-flash-lite,"
-                 "gemini-flash-lite-latest,gemma-4-26b-a4b-it").split(",") if m.strip()]
+# Two tiers (PF_LOGIC 'News AI tiers'). DEEP runs first, on the items that almost surely need
+# understanding and on what the LIGHT model escalated; when its daily free quota ends, the rest waits
+# for a later run. LIGHT then handles everything else. Best model first in each list.
+# Override with GEMINI_MODELS_DEEP / GEMINI_MODELS_LIGHT="a,b,c".
+def _models(env, default):
+    return [m.strip() for m in (os.environ.get(env) or default).split(",") if m.strip()]
+
+
+GEMINI_MODELS_DEEP = _models("GEMINI_MODELS_DEEP", "gemini-3-flash-preview,gemini-flash-latest")
+GEMINI_MODELS_LIGHT = _models("GEMINI_MODELS_LIGHT", "gemini-3.1-flash-lite,gemini-flash-lite-latest,gemma-4-26b-a4b-it")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 AI_BATCH = 50                 # items per queue request
-AI_BUDGET_SEC = 12 * 60       # stage 3 time budget per run
+AI_BUDGET_SEC = 12 * 60       # stage 3 time budget per run, both tiers together
+AI_DEEP_MAX_SEC = 6 * 60      # DEEP may use at most this much of it, so LIGHT always gets a turn
 AI_CALL_GAP = 4.5             # stay well under the free-tier requests-per-minute limit
 DECISIONS = {"NEW_CATALYST", "CONFIRMS", "REFUTES", "STANDALONE", "ANALYST", "DISCARD", "ASK"}
 
@@ -221,12 +230,12 @@ def to_item(h):
 
 # ---------------- stage 3: Gemini ----------------
 class Gemini:
-    """Tries the models of GEMINI_MODELS in order. Busy (503) -> next model for this item;
+    """Tries the given models in order. Busy (503) -> next model for this item;
     no quota (429) or not available (404) -> that model is skipped for the rest of the run."""
 
-    def __init__(self):
+    def __init__(self, models):
         self.client = httpx.Client(timeout=120, headers={"x-goog-api-key": GEMINI_API_KEY})
-        self.models = list(GEMINI_MODELS)
+        self.models = list(models)
         self.dead = set()
         self.model = self.models[0]
         self.last = 0.0
@@ -275,6 +284,8 @@ class Gemini:
                     self.dead.add(model)
                     log(f"Gemini {model}: {r.status_code} - skipped for this run")
                     break
+                if r.status_code in (500, 503):
+                    log(f"Gemini {model}: {r.status_code} busy (attempt {attempt + 1})")
                 if r.status_code in (500, 503) and attempt == 0:
                     time.sleep(5)
                     continue
@@ -288,14 +299,17 @@ class QuotaError(Exception):
     pass
 
 
-def run_ai(ords, stats, deadline):
+def run_ai(ords, stats, deadline, tier, models):
+    """One tier of stage 3. The DB decides which items belong to the tier (newest first).
+    A LIGHT decision other than DISCARD or ANALYST comes back in the DEEP queue of a later run."""
     if not GEMINI_API_KEY:
         log("GEMINI_API_KEY not set - stage 3 skipped")
         return
-    gem = Gemini()
+    gem = Gemini(models)
     done_ids = set()
+    n = 0
     while time.time() < deadline:
-        q = ords.get(f"news/ai_queue?limit={AI_BATCH}")
+        q = ords.get(f"news/ai_queue?limit={AI_BATCH}&tier={tier}")
         items = [i for i in q.get("items") or [] if i["inbox_id"] not in done_ids]
         if not items:
             break
@@ -305,17 +319,29 @@ def run_ai(ords, stats, deadline):
             done_ids.add(item["inbox_id"])
             try:
                 res = gem.ask(q["instructions"], item)
-                check(ords.post("news/ai_result", {"inbox_id": item["inbox_id"], "model": gem.model, "result": res}),
-                      "news/ai_result")
+                check(ords.post("news/ai_result", {"inbox_id": item["inbox_id"], "model": gem.model,
+                                                   "tier": tier, "result": res}), "news/ai_result")
+                n += 1
                 stats["ai"] += 1
+                stats["ai_" + tier.lower()] += 1
                 if not res["body_he"]:
                     stats["no_summary"] += 1
+                if tier == "LIGHT" and str(res.get("decision", "")).upper() not in ("DISCARD", "ANALYST"):
+                    stats["escalated"] += 1
             except QuotaError as e:
-                stats["failed"].append(f"AI stopped: {e}")
-                return
+                if tier == "DEEP":
+                    # expected: the good models' daily free quota is small; their queue waits for a later run
+                    stats["notes"].append("DEEP quota used up, the rest waits")
+                    log(f"stage 3 {tier}: quota used up - {e}")
+                else:
+                    stats["failed"].append(f"AI {tier} stopped: {e}")
+                break
             except Exception as e:
-                stats["failed"].append(f"AI {item.get('symbol')} {item['inbox_id']}: {str(e)[:150]}")
-    log(f"stage 3: {stats['ai']} items decided by {gem.model}")
+                stats["failed"].append(f"AI {tier} {item.get('symbol')} {item['inbox_id']}: {str(e)[:150]}")
+        else:
+            continue
+        break
+    log(f"stage 3 {tier}: {n} items decided, last model {gem.model}")
 
 
 # ---------------- main ----------------
@@ -418,7 +444,7 @@ def main():
     t0 = time.time()
     ords = Ords()
     stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "failed": [], "t_story": 0.0, "t_ords": 0.0,
-             "ai": 0, "no_summary": 0}
+             "ai": 0, "ai_deep": 0, "ai_light": 0, "escalated": 0, "no_summary": 0, "notes": []}
     status, message = "OK", ""
     bodies = []
     try:
@@ -434,7 +460,11 @@ def main():
         run_queue(ords, token, bodies, bodies, stats, t0 + RUN_BUDGET_SEC)
         if bodies:
             message += f"{len(bodies)} bodies left for the next run. "
-        run_ai(ords, stats, time.time() + AI_BUDGET_SEC)
+        ai_start = time.time()
+        run_ai(ords, stats, ai_start + min(AI_DEEP_MAX_SEC, AI_BUDGET_SEC), "DEEP", GEMINI_MODELS_DEEP)
+        run_ai(ords, stats, ai_start + AI_BUDGET_SEC, "LIGHT", GEMINI_MODELS_LIGHT)
+        if stats["notes"]:
+            message += " ".join(stats["notes"]) + ". "
     except SystemExit as e:
         status, message = "ERROR", str(e)
     except Exception as e:
@@ -445,7 +475,8 @@ def main():
     summary = (f"headlines {stats['headlines']}, new {stats['new']}, bodies {stats['bodies']} "
                f"(avg TradingView {stats['t_story'] / n:.1f}s, DB {stats['t_ords'] / n:.1f}s), "
                f"tv filled {stats['tv_filled']}, AI decided {stats['ai']} "
-               f"(no summary {stats['no_summary']}), {int(time.time() - t0)}s. {message}").strip()
+               f"(deep {stats['ai_deep']}, light {stats['ai_light']}, escalated {stats['escalated']}, "
+               f"no summary {stats['no_summary']}), {int(time.time() - t0)}s. {message}").strip()
     log(f"{status}: {summary}")
     for f in stats["failed"]:
         log("FAILED " + f)

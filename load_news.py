@@ -6,7 +6,9 @@ Portfolio news loader (GitHub Actions).
    TradingView MCP server and loads them to PF_NEWS_INBOX (stage 1, title rules run in the DB).
 4. For headlines still KEEP/REVIEW without a body: pulls the story text and runs stage 2 (body rules).
 5. Logs the run to PF_LOAD_RUN (RUN_TYPE NEWS).
-6. Stage 3: sends each KEEP/REVIEW item with a body to Gemini and stores its proposal in PF_NEWS_AI (Claude reviews).
+6. Stage 3: sends each KEEP/REVIEW item with a body to Gemini and stores its proposal in PF_NEWS_AI,
+   together with a Hebrew factual summary of the story (body_he) that the external auditor reads
+   instead of the full story, because the MCP connector truncates anything over 4000 chars.
 Secrets: ORDS_BASE, ORDS_CLIENT_ID, ORDS_CLIENT_SECRET, GEMINI_API_KEY (optional)
 """
 import asyncio
@@ -249,6 +251,8 @@ class Gemini:
             res = res[0]
         if str(res.get("decision", "")).upper() not in DECISIONS:
             raise RuntimeError(f"bad decision: {text[:200]}")
+        # the auditor reads this instead of the story, so it must be there and must fit the column
+        res["body_he"] = (res.get("body_he") or "")[:2400]
         return res
 
     def ask(self, instructions, item):
@@ -304,6 +308,8 @@ def run_ai(ords, stats, deadline):
                 check(ords.post("news/ai_result", {"inbox_id": item["inbox_id"], "model": gem.model, "result": res}),
                       "news/ai_result")
                 stats["ai"] += 1
+                if not res["body_he"]:
+                    stats["no_summary"] += 1
             except QuotaError as e:
                 stats["failed"].append(f"AI stopped: {e}")
                 return
@@ -411,7 +417,8 @@ def run_queue(ords, token, queue, bodies, stats, deadline):
 def main():
     t0 = time.time()
     ords = Ords()
-    stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "failed": [], "t_story": 0.0, "t_ords": 0.0, "ai": 0}
+    stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "failed": [], "t_story": 0.0, "t_ords": 0.0,
+             "ai": 0, "no_summary": 0}
     status, message = "OK", ""
     bodies = []
     try:
@@ -437,7 +444,8 @@ def main():
     n = max(stats["bodies"], 1)
     summary = (f"headlines {stats['headlines']}, new {stats['new']}, bodies {stats['bodies']} "
                f"(avg TradingView {stats['t_story'] / n:.1f}s, DB {stats['t_ords'] / n:.1f}s), "
-               f"tv filled {stats['tv_filled']}, AI decided {stats['ai']}, {int(time.time() - t0)}s. {message}").strip()
+               f"tv filled {stats['tv_filled']}, AI decided {stats['ai']} "
+               f"(no summary {stats['no_summary']}), {int(time.time() - t0)}s. {message}").strip()
     log(f"{status}: {summary}")
     for f in stats["failed"]:
         log("FAILED " + f)

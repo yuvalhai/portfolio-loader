@@ -62,6 +62,8 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 AI_BATCH = 50                 # items per queue request
 AI_BUDGET_SEC = 12 * 60       # stage 3 time budget per run, both tiers together
 AI_DEEP_MAX_SEC = 6 * 60      # DEEP may use at most this much of it, so LIGHT always gets a turn
+AI_BUSY_PAUSE_SEC = 30        # all models of a tier busy on an item -> skip it and wait this long
+AI_BUSY_STOP = 3              # ...and stop the tier after this many such items in a row
 AI_CALL_GAP = 4.5             # stay well under the free-tier requests-per-minute limit
 DECISIONS = {"NEW_CATALYST", "CONFIRMS", "REFUTES", "STANDALONE", "ANALYST", "DISCARD", "ASK"}
 
@@ -292,10 +294,19 @@ class Gemini:
                 if r.status_code in (500, 503):
                     break
                 r.raise_for_status()
-        raise QuotaError("no Gemini model answered: " + ", ".join(errors[-6:]))
+        # every model is out of quota or missing -> nothing more this run; otherwise some were only busy
+        if all(m in self.dead for m in self.models):
+            raise QuotaError("no Gemini model answered: " + ", ".join(errors[-6:]))
+        raise BusyError("all Gemini models busy: " + ", ".join(errors[-6:]))
 
 
 class QuotaError(Exception):
+    """All models of the tier are out of quota (429) or unavailable (404): stop the tier for this run."""
+    pass
+
+
+class BusyError(Exception):
+    """The models that still have quota are all busy (500/503) right now: skip the item, pause, go on."""
     pass
 
 
@@ -308,6 +319,7 @@ def run_ai(ords, stats, deadline, tier, models):
     gem = Gemini(models)
     done_ids = set()
     n = 0
+    busy_streak = 0
     while time.time() < deadline:
         q = ords.get(f"news/ai_queue?limit={AI_BATCH}&tier={tier}")
         items = [i for i in q.get("items") or [] if i["inbox_id"] not in done_ids]
@@ -319,6 +331,7 @@ def run_ai(ords, stats, deadline, tier, models):
             done_ids.add(item["inbox_id"])
             try:
                 res = gem.ask(q["instructions"], item)
+                busy_streak = 0
                 check(ords.post("news/ai_result", {"inbox_id": item["inbox_id"], "model": gem.model,
                                                    "tier": tier, "result": res}), "news/ai_result")
                 n += 1
@@ -336,6 +349,15 @@ def run_ai(ords, stats, deadline, tier, models):
                 else:
                     stats["failed"].append(f"AI {tier} stopped: {e}")
                 break
+            except BusyError as e:
+                # a busy spell at Google is temporary: the item stays in the queue for a later run
+                busy_streak += 1
+                stats["busy_skipped"] += 1
+                log(f"stage 3 {tier}: item {item['inbox_id']} skipped, models busy ({busy_streak} in a row)")
+                if busy_streak >= AI_BUSY_STOP:
+                    stats["failed"].append(f"AI {tier} stopped: models busy on {busy_streak} items in a row")
+                    break
+                time.sleep(AI_BUSY_PAUSE_SEC)
             except Exception as e:
                 stats["failed"].append(f"AI {tier} {item.get('symbol')} {item['inbox_id']}: {str(e)[:150]}")
         else:
@@ -444,7 +466,7 @@ def main():
     t0 = time.time()
     ords = Ords()
     stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "failed": [], "t_story": 0.0, "t_ords": 0.0,
-             "ai": 0, "ai_deep": 0, "ai_light": 0, "escalated": 0, "no_summary": 0, "notes": []}
+             "ai": 0, "ai_deep": 0, "ai_light": 0, "escalated": 0, "no_summary": 0, "busy_skipped": 0, "notes": []}
     status, message = "OK", ""
     bodies = []
     try:
@@ -476,7 +498,8 @@ def main():
                f"(avg TradingView {stats['t_story'] / n:.1f}s, DB {stats['t_ords'] / n:.1f}s), "
                f"tv filled {stats['tv_filled']}, AI decided {stats['ai']} "
                f"(deep {stats['ai_deep']}, light {stats['ai_light']}, escalated {stats['escalated']}, "
-               f"no summary {stats['no_summary']}), {int(time.time() - t0)}s. {message}").strip()
+               f"busy skipped {stats['busy_skipped']}, no summary {stats['no_summary']}), "
+               f"{int(time.time() - t0)}s. {message}").strip()
     log(f"{status}: {summary}")
     for f in stats["failed"]:
         log("FAILED " + f)

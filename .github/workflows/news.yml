@@ -2,7 +2,7 @@ name: News loader
 
 on:
   schedule:
-    - cron: "17 */4 * * *"   # every 4 hours (UTC)
+    - cron: "17 */2 * * *"   # every 2 hours (UTC)
   workflow_dispatch:
 
 # never two runs at once: each run rotates the TradingView refresh token
@@ -13,7 +13,8 @@ concurrency:
 jobs:
   news:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    # headlines + bodies up to 25 min, then Gemini up to 30 min, plus setup
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

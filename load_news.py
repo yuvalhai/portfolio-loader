@@ -11,6 +11,8 @@ Portfolio news loader (GitHub Actions).
    instead of the full story, because the MCP connector truncates anything over 4000 bytes.
    Two tiers, newest first: DEEP (good models, first) on the categories that need understanding and on
    escalations; LIGHT (cheap models) on the rest. A LIGHT decision other than DISCARD/ANALYST escalates.
+   Model answers are parsed leniently (text or a second object after the JSON, plain double quotes inside
+   Hebrew text such as ארה"ב), because such answers used to fail again on every run.
 Secrets: ORDS_BASE, ORDS_CLIENT_ID, ORDS_CLIENT_SECRET, GEMINI_API_KEY (optional)
 """
 import asyncio
@@ -61,7 +63,7 @@ GEMINI_MODELS_DEEP = _models("GEMINI_MODELS_DEEP", "gemini-3-flash-preview,gemin
 GEMINI_MODELS_LIGHT = _models("GEMINI_MODELS_LIGHT", "gemini-3.1-flash-lite,gemini-flash-lite-latest,gemma-4-26b-a4b-it")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
 AI_BATCH = 50                 # items per queue request
-AI_BUDGET_SEC = 12 * 60       # stage 3 time budget per run, both tiers together
+AI_BUDGET_SEC = 30 * 60       # stage 3 time budget per run, both tiers together (was 12 min; user decision 24/09/2026)
 AI_DEEP_MAX_SEC = 6 * 60      # DEEP may use at most this much of it, so LIGHT always gets a turn
 AI_WORKERS = 4                # items asked at once; AI_CALL_GAP still spaces the call starts (~13 per minute at most)
 AI_BUSY_PAUSE_SEC = 30        # all models of a tier busy on an item -> skip it and wait this long
@@ -233,6 +235,51 @@ def to_item(h):
 
 
 # ---------------- stage 3: Gemini ----------------
+def repair_quotes(s):
+    """Escapes plain double quotes that sit inside a JSON string value (for example the Hebrew
+    abbreviation ארה"ב, or a quotation copied from the story). A quote is taken as the end of the
+    string only when a JSON separator (, : } ]) or the end of the text follows it."""
+    out = []
+    in_str = False
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if in_str and c == "\\":
+            out.append(s[i:i + 2])
+            i += 2
+            continue
+        if c == '"':
+            if not in_str:
+                in_str = True
+                out.append(c)
+            else:
+                rest = s[i + 1:].lstrip()
+                if not rest or rest[0] in ",:}]":
+                    in_str = False
+                    out.append(c)
+                else:
+                    out.append('\\"')
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def loads_lenient(text):
+    """The first JSON object in a model answer. Tolerates text before it, anything after it
+    (a second object, a note) and plain double quotes inside string values."""
+    start = text.find("{")
+    if start < 0:
+        return json.loads(text)
+    s = text[start:]
+    dec = json.JSONDecoder()
+    try:
+        return dec.raw_decode(s)[0]
+    except ValueError:
+        return dec.raw_decode(repair_quotes(s))[0]
+
+
 class Gemini:
     """Tries the given models in order. Busy (503) -> next model for this item;
     no quota (429) or not available (404) -> that model is skipped for the rest of the run."""
@@ -249,7 +296,9 @@ class Gemini:
         text = json.dumps(item, ensure_ascii=False)
         if model.startswith("gemma"):   # Gemma: no system instruction and no JSON mode
             return {"contents": [{"role": "user", "parts": [{"text": instructions + "\n\nINPUT:\n" + text
-                                                             + "\n\nAnswer with the JSON object only."}]}],
+                                                             + "\n\nAnswer with one JSON object only, nothing after it."
+                                                             + " Never put a plain double quote inside a text value:"
+                                                             + " write Hebrew abbreviations with ״ (for example ארה״ב)."}]}],
                     "generationConfig": {"temperature": 0.2}}
         return {"system_instruction": {"parts": [{"text": instructions}]},
                 "contents": [{"role": "user", "parts": [{"text": text}]}],
@@ -259,8 +308,7 @@ class Gemini:
     def _parse(data):
         text = "".join(p.get("text", "") for c in data.get("candidates", [])[:1]
                        for p in c.get("content", {}).get("parts", []))
-        m = re.search(r"\{.*\}", text, re.S)
-        res = json.loads(m.group(0) if m else text)
+        res = loads_lenient(text)
         if isinstance(res, list):
             res = res[0]
         if str(res.get("decision", "")).upper() not in DECISIONS:
@@ -286,7 +334,11 @@ class Gemini:
                     if model != self.model:
                         log(f"Gemini model now: {model}")
                         self.model = model
-                    return self._parse(r.json())
+                    try:
+                        return self._parse(r.json())
+                    except ValueError as e:
+                        # name the model, so the run log shows which one writes broken JSON
+                        raise RuntimeError(f"{model}: {e}") from e
                 errors.append(f"{model} {r.status_code}")
                 if r.status_code in (404, 429):
                     self.dead.add(model)

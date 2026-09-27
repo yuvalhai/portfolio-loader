@@ -4,6 +4,8 @@ Portfolio news loader (GitHub Actions).
 2. Refreshes it and saves the new one immediately (TradingView rotates refresh tokens).
 3. For every held/watched stock: fills a missing TV_SYMBOL, pulls new headlines from the
    TradingView MCP server and loads them to PF_NEWS_INBOX (stage 1, title rules run in the DB).
+   After the headlines, one batch call fetches market cap and 30-day average traded value for the
+   stocks of this run and sends them to /loader/security/market_data (the DB converts to USD).
 4. For headlines still KEEP/REVIEW without a body: pulls the story text and runs stage 2 (body rules).
 5. Logs the run to PF_LOAD_RUN (RUN_TYPE NEWS).
 6. Stage 3: sends each KEEP/REVIEW item with a body to Gemini and stores its proposal in PF_NEWS_AI,
@@ -48,6 +50,7 @@ WORKERS = 6                   # TradingView calls in flight at the same time
 MAX_RECONNECTS = 5            # a broken TradingView connection is reopened this many times per run
 SESSION_MAX_SEC = 12 * 60     # access token lives 15 minutes; renew before that
 US_EXCHANGES = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"]
+MD_COLUMNS = ["market_cap_basic", "fundamental_currency_code", "close", "average_volume_30d_calc", "currency"]
 
 # stage 3 by Gemini (skipped when GEMINI_API_KEY is not set)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -218,6 +221,35 @@ class Tv:
 
     async def story(self, news_id):
         return story_text(await self.call("get_news_story", {"id": news_id}))
+
+    async def market_data(self, tv_symbols):
+        """Market cap and 30-day average traded value (volume x close, in the price currency)
+        for up to 50 symbols in one call. Returns {tv_symbol: {"cap","cap_cur","adv","adv_cur"}}."""
+        data = await self.call("get_symbol_data_batch", {"symbols": tv_symbols[:50], "columns": MD_COLUMNS})
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            rows = data.get("symbols") or data.get("rows") or data.get("results") or data.get("data") or []
+            if isinstance(rows, dict):   # keyed by symbol
+                rows = [dict(v, symbol=k) for k, v in rows.items() if isinstance(v, dict)]
+        else:
+            rows = []
+        out = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            sym = r.get("symbol") or r.get("s") or r.get("ticker")
+            v = r.get("values") or r.get("d") or r
+            if isinstance(v, list):      # screener style: values in MD_COLUMNS order
+                v = dict(zip(MD_COLUMNS, v))
+            close, vol = v.get("close"), v.get("average_volume_30d_calc")
+            item = {"cap": v.get("market_cap_basic"),
+                    "cap_cur": v.get("fundamental_currency_code") or v.get("currency") or "USD",
+                    "adv": close * vol if close and vol else None,
+                    "adv_cur": v.get("currency") or "USD"}
+            if sym and (item["cap"] or item["adv"]):
+                out[sym] = item
+        return out
 
 
 def to_item(h):
@@ -536,11 +568,43 @@ def run_queue(ords, token, queue, bodies, stats, deadline):
             time.sleep(10)
 
 
+def load_market_data(ords, token, stocks, stats):
+    """One batch call per run for the stocks of this run (market cap + average traded value).
+    The DB converts to USD. A failure here never stops the run."""
+    syms = {s["tv"]: s["id"] for s in stocks if s.get("tv")}
+    if not syms:
+        return
+
+    async def fetch():
+        headers = {"Authorization": f"Bearer {token.access_token}"}
+        async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(60, read=120)) as client:
+            async with streamable_http_client(TV_MCP_URL, http_client=client) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+                    tv = Tv(session, [t.name for t in (await session.list_tools()).tools])
+                    return await tv.market_data(list(syms))
+
+    try:
+        if token.expiring():
+            token.refresh()
+        data = asyncio.run(fetch())
+        items = [dict(id=syms[k], **v) for k, v in data.items() if k in syms]
+        if not items:
+            stats["failed"].append("market data: no values returned")
+            return
+        res = check(ords.post("security/market_data", {"items": items}), "security/market_data")
+        stats["caps"] = res.get("updated", 0)
+        log(f"market data: {len(items)} sent, {stats['caps']} updated")
+    except Exception as e:
+        stats["failed"].append(f"market data: {leaf_errors(e)[:150]}")
+
+
 def main():
     t0 = time.time()
     ords = Ords()
-    stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "failed": [], "t_story": 0.0, "t_ords": 0.0,
-             "ai": 0, "ai_deep": 0, "ai_light": 0, "escalated": 0, "no_summary": 0, "busy_skipped": 0, "notes": []}
+    stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "caps": 0, "failed": [], "t_story": 0.0,
+             "t_ords": 0.0, "ai": 0, "ai_deep": 0, "ai_light": 0, "escalated": 0, "no_summary": 0,
+             "busy_skipped": 0, "notes": []}
     status, message = "OK", ""
     bodies = []
     try:
@@ -550,6 +614,7 @@ def main():
         log(f"{len(stocks)} stocks")
         heads = [Job("HEAD", s) for s in stocks]
         run_queue(ords, token, heads, bodies, stats, t0 + HEAD_BUDGET_SEC)
+        load_market_data(ords, token, stocks, stats)
         if heads:
             message += f"Headlines not reached for {len(heads)} stocks (time budget). "
         log(f"headlines done: {stats['headlines']} read, {stats['new']} new, {len(bodies)} bodies to fetch")
@@ -570,7 +635,7 @@ def main():
     n = max(stats["bodies"], 1)
     summary = (f"headlines {stats['headlines']}, new {stats['new']}, bodies {stats['bodies']} "
                f"(avg TradingView {stats['t_story'] / n:.1f}s, DB {stats['t_ords'] / n:.1f}s), "
-               f"tv filled {stats['tv_filled']}, AI decided {stats['ai']} "
+               f"tv filled {stats['tv_filled']}, market data {stats['caps']}, AI decided {stats['ai']} "
                f"(deep {stats['ai_deep']}, light {stats['ai_light']}, escalated {stats['escalated']}, "
                f"busy skipped {stats['busy_skipped']}, no summary {stats['no_summary']}), "
                f"{int(time.time() - t0)}s. {message}").strip()

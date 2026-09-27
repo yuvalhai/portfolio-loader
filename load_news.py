@@ -229,9 +229,13 @@ class Tv:
         if isinstance(data, list):
             rows = data
         elif isinstance(data, dict):
-            rows = data.get("symbols") or data.get("rows") or data.get("results") or data.get("data") or []
-            if isinstance(rows, dict):   # keyed by symbol
-                rows = [dict(v, symbol=k) for k, v in rows.items() if isinstance(v, dict)]
+            # TradingView answers {"EXCHANGE:TICKER": {column: value}}; call() already unwrapped "data"
+            if any(":" in k for k in data):
+                rows = [dict(v, symbol=k) for k, v in data.items() if ":" in k and isinstance(v, dict)]
+            else:
+                rows = data.get("symbols") or data.get("rows") or data.get("results") or data.get("data") or []
+                if isinstance(rows, dict):   # keyed by symbol
+                    rows = [dict(v, symbol=k) for k, v in rows.items() if isinstance(v, dict)]
         else:
             rows = []
         out = {}

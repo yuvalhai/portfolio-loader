@@ -7,6 +7,11 @@ Portfolio news loader (GitHub Actions).
    After the headlines, one batch call fetches market cap and 30-day average traded value for the
    stocks of this run and sends them to /loader/security/market_data (the DB converts to USD).
 4. For headlines still KEEP/REVIEW without a body: pulls the story text and runs stage 2 (body rules).
+   Then (thesis financial data layer, PF_LOGIC 'Thesis evaluation - financial data layer'): one more batch
+   call fetches current fundamentals for the same stocks and sends them to /loader/security/fin_snapshot;
+   and for the stocks the DB lists as due (/loader/security/fin_history_due: never fetched, or a newer report
+   is expected) the quarterly and annual history goes to /loader/security/fin_history. Market data is not
+   touched by this part. If the DB endpoints are not there yet, this part is skipped quietly.
 5. Logs the run to PF_LOAD_RUN (RUN_TYPE NEWS).
 6. Stage 3: sends each KEEP/REVIEW item with a body to Gemini and stores its proposal in PF_NEWS_AI,
    together with a Hebrew factual summary of the story (body_he) that the external auditor reads
@@ -51,6 +56,14 @@ MAX_RECONNECTS = 5            # a broken TradingView connection is reopened this
 SESSION_MAX_SEC = 12 * 60     # access token lives 15 minutes; renew before that
 US_EXCHANGES = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"]
 MD_COLUMNS = ["market_cap_basic", "fundamental_currency_code", "close", "average_volume_30d_calc", "currency"]
+# thesis financial data layer: current values (one row per stock) and history (per stock and period)
+FIN_COLUMNS = ["fundamental_currency_code", "total_revenue_ttm", "total_revenue_fy", "gross_margin_ttm",
+               "cash_f_operating_activities_ttm", "neg_capital_expenditures_ttm", "free_cash_flow_ttm",
+               "total_debt_fq", "cash_n_short_term_invest_fq", "effective_interest_rate_on_debt_ttm",
+               "share_buyback_ratio_fy", "fiscal_period_end_fy"]
+FIN_HISTORY_PER_RUN = 15      # stocks per run whose history is fetched (2 calls each); the rest waits for later runs
+FIN_HISTORY_QUARTERS_DAYS = 800   # look-back for quarterly history (8+ quarters)
+FIN_HISTORY_YEARS_DAYS = 1500     # look-back for annual history (3+ fiscal years)
 
 # stage 3 by Gemini (skipped when GEMINI_API_KEY is not set)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -225,19 +238,7 @@ class Tv:
     async def market_data(self, tv_symbols):
         """Market cap and 30-day average traded value (volume x close, in the price currency)
         for up to 50 symbols in one call. Returns {tv_symbol: {"cap","cap_cur","adv","adv_cur"}}."""
-        data = await self.call("get_symbol_data_batch", {"symbols": tv_symbols[:50], "columns": MD_COLUMNS})
-        if isinstance(data, list):
-            rows = data
-        elif isinstance(data, dict):
-            # TradingView answers {"EXCHANGE:TICKER": {column: value}}; call() already unwrapped "data"
-            if any(":" in k for k in data):
-                rows = [dict(v, symbol=k) for k, v in data.items() if ":" in k and isinstance(v, dict)]
-            else:
-                rows = data.get("symbols") or data.get("rows") or data.get("results") or data.get("data") or []
-                if isinstance(rows, dict):   # keyed by symbol
-                    rows = [dict(v, symbol=k) for k, v in rows.items() if isinstance(v, dict)]
-        else:
-            rows = []
+        rows = batch_rows(await self.call("get_symbol_data_batch", {"symbols": tv_symbols[:50], "columns": MD_COLUMNS}))
         out = {}
         for r in rows:
             if not isinstance(r, dict):
@@ -254,6 +255,42 @@ class Tv:
             if sym and (item["cap"] or item["adv"]):
                 out[sym] = item
         return out
+
+    async def fin_snapshot(self, tv_symbols):
+        """Current fundamentals for up to 50 symbols in one call. Returns {tv_symbol: {column: value}}."""
+        rows = batch_rows(await self.call("get_symbol_data_batch", {"symbols": tv_symbols[:50], "columns": FIN_COLUMNS}))
+        out = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            sym = r.get("symbol") or r.get("s") or r.get("ticker")
+            v = r.get("values") or r.get("d") or r
+            if isinstance(v, list):
+                v = dict(zip(FIN_COLUMNS, v))
+            vals = {c: v.get(c) for c in FIN_COLUMNS if v.get(c) is not None}
+            if sym and len(vals) > 1:
+                out[sym] = vals
+        return out
+
+    async def fin_history(self, tv_symbol, period, days):
+        """Quarterly (fq) or annual (fy) history: labels and series (revenue, gross_profit, fcf, total_debt ...)."""
+        since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
+        return await self.call("get_financial_history", {"symbol": tv_symbol, "period": period, "date_from": since})
+
+
+def batch_rows(data):
+    """Rows of a get_symbol_data_batch answer, whatever shape TradingView used."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        # TradingView answers {"EXCHANGE:TICKER": {column: value}}; call() already unwrapped "data"
+        if any(":" in k for k in data):
+            return [dict(v, symbol=k) for k, v in data.items() if ":" in k and isinstance(v, dict)]
+        rows = data.get("symbols") or data.get("rows") or data.get("results") or data.get("data") or []
+        if isinstance(rows, dict):   # keyed by symbol
+            rows = [dict(v, symbol=k) for k, v in rows.items() if isinstance(v, dict)]
+        return rows
+    return []
 
 
 def to_item(h):
@@ -603,12 +640,75 @@ def load_market_data(ords, token, stocks, stats):
         stats["failed"].append(f"market data: {leaf_errors(e)[:150]}")
 
 
+def load_fin_data(ords, token, stocks, stats):
+    """Thesis financial data layer. Current fundamentals for the stocks of this run (one batch call), then
+    history for the stocks the DB says are due. Never touches market data; a failure never stops the run.
+    If the DB endpoints do not exist yet (404), the part is skipped with one log line."""
+    syms = {s["tv"]: s["id"] for s in stocks if s.get("tv")}
+
+    async def fetch_snapshot():
+        headers = {"Authorization": f"Bearer {token.access_token}"}
+        async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(60, read=120)) as client:
+            async with streamable_http_client(TV_MCP_URL, http_client=client) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+                    tv = Tv(session, [t.name for t in (await session.list_tools()).tools])
+                    return await tv.fin_snapshot(list(syms))
+
+    async def fetch_history(due):
+        headers = {"Authorization": f"Bearer {token.access_token}"}
+        out = []
+        async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(60, read=120)) as client:
+            async with streamable_http_client(TV_MCP_URL, http_client=client) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+                    tv = Tv(session, [t.name for t in (await session.list_tools()).tools])
+                    for d in due:
+                        try:
+                            fq = await tv.fin_history(d["tv"], "fq", FIN_HISTORY_QUARTERS_DAYS)
+                            fy = await tv.fin_history(d["tv"], "fy", FIN_HISTORY_YEARS_DAYS)
+                            out.append({"id": d["id"], "fq": fq, "fy": fy})
+                        except Exception as e:
+                            out.append({"id": d["id"], "error": str(e)[:300]})
+                            if "429" in str(e):   # TradingView scanner limit: stop, the rest waits
+                                break
+        return out
+
+    try:
+        if syms:
+            if token.expiring():
+                token.refresh()
+            data = asyncio.run(fetch_snapshot())
+            items = [{"id": syms[k], "values": v} for k, v in data.items() if k in syms]
+            if items:
+                res = check(ords.post("security/fin_snapshot", {"items": items}), "security/fin_snapshot")
+                stats["fin_snap"] = res.get("updated", 0)
+        due = ords.get(f"security/fin_history_due?limit={FIN_HISTORY_PER_RUN}").get("items") or []
+        if due:
+            if token.expiring():
+                token.refresh()
+            for h in asyncio.run(fetch_history(due)):
+                res = check(ords.post("security/fin_history", h), "security/fin_history")
+                if "error" in h:
+                    stats["failed"].append(f"fin history {h['id']}: {h['error'][:120]}")
+                else:
+                    stats["fin_hist"] += 1
+        log(f"fin data: snapshot {stats['fin_snap']}, history {stats['fin_hist']}")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            log("fin data: DB endpoints not installed yet - skipped")
+        else:
+            stats["failed"].append(f"fin data: {leaf_errors(e)[:150]}")
+    except Exception as e:
+        stats["failed"].append(f"fin data: {leaf_errors(e)[:150]}")
+
+
 def main():
     t0 = time.time()
     ords = Ords()
     stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "caps": 0, "failed": [], "t_story": 0.0,
              "t_ords": 0.0, "ai": 0, "ai_deep": 0, "ai_light": 0, "escalated": 0, "no_summary": 0,
-             "busy_skipped": 0, "notes": []}
+             "busy_skipped": 0, "notes": [], "fin_snap": 0, "fin_hist": 0}
     status, message = "OK", ""
     bodies = []
     try:
@@ -619,6 +719,7 @@ def main():
         heads = [Job("HEAD", s) for s in stocks]
         run_queue(ords, token, heads, bodies, stats, t0 + HEAD_BUDGET_SEC)
         load_market_data(ords, token, stocks, stats)
+        load_fin_data(ords, token, stocks, stats)
         if heads:
             message += f"Headlines not reached for {len(heads)} stocks (time budget). "
         log(f"headlines done: {stats['headlines']} read, {stats['new']} new, {len(bodies)} bodies to fetch")
@@ -639,7 +740,8 @@ def main():
     n = max(stats["bodies"], 1)
     summary = (f"headlines {stats['headlines']}, new {stats['new']}, bodies {stats['bodies']} "
                f"(avg TradingView {stats['t_story'] / n:.1f}s, DB {stats['t_ords'] / n:.1f}s), "
-               f"tv filled {stats['tv_filled']}, market data {stats['caps']}, AI decided {stats['ai']} "
+               f"tv filled {stats['tv_filled']}, market data {stats['caps']}, "
+               f"fin snapshot {stats['fin_snap']}, fin history {stats['fin_hist']}, AI decided {stats['ai']} "
                f"(deep {stats['ai_deep']}, light {stats['ai_light']}, escalated {stats['escalated']}, "
                f"busy skipped {stats['busy_skipped']}, no summary {stats['no_summary']}), "
                f"{int(time.time() - t0)}s. {message}").strip()

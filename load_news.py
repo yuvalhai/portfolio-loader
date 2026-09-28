@@ -630,9 +630,15 @@ def load_market_data(ords, token, stocks, stats):
             token.refresh()
         data = asyncio.run(fetch())
         items = [dict(id=syms[k], **v) for k, v in data.items() if k in syms]
-        if not items:
+        if not items:   # nothing at all came back: a transient TradingView failure, not missing data
             stats["failed"].append("market data: no values returned")
             return
+        # Values came back for some stocks but not for these: TradingView has no data for them.
+        # The DB records the attempt (MARKET_NO_DATA_AT) instead of the run failing.
+        missing = [{"id": i, "no_data": True} for k, i in syms.items() if k not in data]
+        items += missing
+        if missing:
+            stats["notes"].append(f"market data: no values for {len(missing)} stocks")
         res = check(ords.post("security/market_data", {"items": items}), "security/market_data")
         stats["caps"] = res.get("updated", 0)
         log(f"market data: {len(items)} sent, {stats['caps']} updated")
@@ -691,6 +697,8 @@ def load_fin_data(ords, token, stocks, stats):
                 res = check(ords.post("security/fin_history", h), "security/fin_history")
                 if "error" in h:
                     stats["failed"].append(f"fin history {h['id']}: {h['error'][:120]}")
+                elif res.get("failed"):   # DB moved the stock to the Issues screen and out of the queue: go on
+                    stats["notes"].append(f"fin history {h['id']} moved to Issues")
                 else:
                     stats["fin_hist"] += 1
         log(f"fin data: snapshot {stats['fin_snap']}, history {stats['fin_hist']}")

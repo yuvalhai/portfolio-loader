@@ -12,6 +12,12 @@ Portfolio news loader (GitHub Actions).
    and for the stocks the DB lists as due (/loader/security/fin_history_due: never fetched, or a newer report
    is expected) the quarterly and annual history goes to /loader/security/fin_history. Market data is not
    touched by this part. If the DB endpoints are not there yet, this part is skipped quietly.
+   Daily (user decision 29/09/2026): /loader/security/fin_history_due decides. Only the first run after
+   FIN_DAILY_HOURS gets daily_due=true, the due history items and the full universe (all held/watched stocks);
+   that run loads market data and the snapshot for the whole universe in batches of 50. Every other run skips
+   market data and financial data. Scanner calls (get_symbol_data_batch, get_financial_history) are spaced
+   SCANNER_GAP apart; a 429 waits SCANNER_429_WAIT and retries once, then the rest of the scanner work waits
+   for the next day.
 5. Logs the run to PF_LOAD_RUN (RUN_TYPE NEWS).
 6. Stage 3: sends each KEEP/REVIEW item with a body to Gemini and stores its proposal in PF_NEWS_AI,
    together with a Hebrew factual summary of the story (body_he) that the external auditor reads
@@ -61,7 +67,11 @@ FIN_COLUMNS = ["fundamental_currency_code", "total_revenue_ttm", "total_revenue_
                "cash_f_operating_activities_ttm", "neg_capital_expenditures_ttm", "free_cash_flow_ttm",
                "total_debt_fq", "cash_n_short_term_invest_fq", "effective_interest_rate_on_debt_ttm",
                "share_buyback_ratio_fy", "fiscal_period_end_fy"]
-FIN_HISTORY_PER_RUN = 15      # stocks per run whose history is fetched (2 calls each); the rest waits for later runs
+FIN_HISTORY_PER_RUN = 40      # stocks per daily run whose history is fetched (2 calls each); the rest waits for the next day
+SCANNER_GAP = 3.0             # seconds between TradingView scanner calls (the scanner answers 429 when called faster)
+SCANNER_429_WAIT = 60         # a 429 from the scanner: wait this long and retry once
+SCANNER_TOOLS = ("get_symbol_data_batch", "get_financial_history")
+_scan = {"last": 0.0, "blocked": False}   # shared by all Tv sessions of the run
 FIN_HISTORY_QUARTERS_DAYS = 800   # look-back for quarterly history (8+ quarters)
 FIN_HISTORY_YEARS_DAYS = 1500     # look-back for annual history (3+ fiscal years)
 
@@ -200,6 +210,32 @@ class Tv:
         return name
 
     async def call(self, suffix, args):
+        if suffix in SCANNER_TOOLS:
+            return await self.scan_call(suffix, args)
+        return await self._call(suffix, args)
+
+    async def scan_call(self, suffix, args):
+        """Scanner calls: spaced SCANNER_GAP apart; on 429 wait and retry once, then mark the scanner blocked."""
+        if _scan["blocked"]:
+            raise RuntimeError("429: TradingView scanner blocked earlier in this run")
+        for attempt in range(2):
+            wait = SCANNER_GAP - (time.time() - _scan["last"])
+            if wait > 0:
+                await asyncio.sleep(wait)
+            _scan["last"] = time.time()
+            try:
+                return await self._call(suffix, args)
+            except RuntimeError as e:
+                if "429" not in str(e):
+                    raise
+                if attempt == 0:
+                    log(f"scanner 429 on {suffix}: waiting {SCANNER_429_WAIT}s")
+                    await asyncio.sleep(SCANNER_429_WAIT)
+                    continue
+                _scan["blocked"] = True
+                raise
+
+    async def _call(self, suffix, args):
         async with self.lock:                      # start calls at most every MIN_CALL_GAP seconds (all workers)
             wait = MIN_CALL_GAP - (time.time() - self.last)
             if wait > 0:
@@ -618,12 +654,24 @@ def load_market_data(ords, token, stocks, stats):
 
     async def fetch():
         headers = {"Authorization": f"Bearer {token.access_token}"}
+        out = {}
         async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(60, read=120)) as client:
             async with streamable_http_client(TV_MCP_URL, http_client=client) as streams:
                 async with ClientSession(streams[0], streams[1]) as session:
                     await session.initialize()
                     tv = Tv(session, [t.name for t in (await session.list_tools()).tools])
-                    return await tv.market_data(list(syms))
+                    keys = list(syms)
+                    for i in range(0, len(keys), 50):   # the daily run covers the whole universe
+                        try:
+                            out.update(await tv.market_data(keys[i:i + 50]))
+                        except RuntimeError as e:
+                            if "429" in str(e):
+                                stats["failed"].append(f"market data: TradingView 429 after {i} stocks, the rest waits")
+                                for k in keys[i:]:
+                                    syms.pop(k, None)   # not reached: do not record them as no data
+                                break
+                            raise
+        return out
 
     try:
         if token.expiring():
@@ -646,7 +694,7 @@ def load_market_data(ords, token, stocks, stats):
         stats["failed"].append(f"market data: {leaf_errors(e)[:150]}")
 
 
-def load_fin_data(ords, token, stocks, stats):
+def load_fin_data(ords, token, stocks, stats, due=None):
     """Thesis financial data layer. Current fundamentals for the stocks of this run (one batch call), then
     history for the stocks the DB says are due. Never touches market data; a failure never stops the run.
     If the DB endpoints do not exist yet (404), the part is skipped with one log line."""
@@ -654,12 +702,22 @@ def load_fin_data(ords, token, stocks, stats):
 
     async def fetch_snapshot():
         headers = {"Authorization": f"Bearer {token.access_token}"}
+        out = {}
         async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(60, read=120)) as client:
             async with streamable_http_client(TV_MCP_URL, http_client=client) as streams:
                 async with ClientSession(streams[0], streams[1]) as session:
                     await session.initialize()
                     tv = Tv(session, [t.name for t in (await session.list_tools()).tools])
-                    return await tv.fin_snapshot(list(syms))
+                    keys = list(syms)
+                    for i in range(0, len(keys), 50):
+                        try:
+                            out.update(await tv.fin_snapshot(keys[i:i + 50]))
+                        except RuntimeError as e:
+                            if "429" in str(e):
+                                stats["failed"].append(f"fin snapshot: TradingView 429 after {i} stocks, the rest waits")
+                                break
+                            raise
+        return out
 
     async def fetch_history(due):
         headers = {"Authorization": f"Bearer {token.access_token}"}
@@ -675,9 +733,10 @@ def load_fin_data(ords, token, stocks, stats):
                             fy = await tv.fin_history(d["tv"], "fy", FIN_HISTORY_YEARS_DAYS)
                             out.append({"id": d["id"], "fq": fq, "fy": fy})
                         except Exception as e:
-                            out.append({"id": d["id"], "error": str(e)[:300]})
-                            if "429" in str(e):   # TradingView scanner limit: stop, the rest waits
+                            if "429" in str(e):   # TradingView scanner limit: stop, the rest waits (no issue for the stock)
+                                stats["failed"].append("fin history: TradingView 429, the rest waits for the next day")
                                 break
+                            out.append({"id": d["id"], "error": str(e)[:300]})
         return out
 
     try:
@@ -689,7 +748,8 @@ def load_fin_data(ords, token, stocks, stats):
             if items:
                 res = check(ords.post("security/fin_snapshot", {"items": items}), "security/fin_snapshot")
                 stats["fin_snap"] = res.get("updated", 0)
-        due = ords.get(f"security/fin_history_due?limit={FIN_HISTORY_PER_RUN}").get("items") or []
+        if due is None:   # older DB without the daily plan
+            due = ords.get(f"security/fin_history_due?limit={FIN_HISTORY_PER_RUN}").get("items") or []
         if due:
             if token.expiring():
                 token.refresh()
@@ -711,6 +771,18 @@ def load_fin_data(ords, token, stocks, stats):
         stats["failed"].append(f"fin data: {leaf_errors(e)[:150]}")
 
 
+def fin_plan(ords):
+    """The daily plan from the DB: {"daily_due", "items", "universe"}. None when the DB is older
+    (no daily_due key) or the endpoint is missing; then the run keeps the old per-run behaviour."""
+    try:
+        plan = ords.get(f"security/fin_history_due?limit={FIN_HISTORY_PER_RUN}")
+    except httpx.HTTPStatusError:
+        return None
+    if not isinstance(plan, dict) or "daily_due" not in plan:
+        return None
+    return plan
+
+
 def main():
     t0 = time.time()
     ords = Ords()
@@ -726,8 +798,13 @@ def main():
         log(f"{len(stocks)} stocks")
         heads = [Job("HEAD", s) for s in stocks]
         run_queue(ords, token, heads, bodies, stats, t0 + HEAD_BUDGET_SEC)
-        load_market_data(ords, token, stocks, stats)
-        load_fin_data(ords, token, stocks, stats)
+        plan = fin_plan(ords)
+        if plan is not None and plan.get("daily_due") is False:
+            stats["notes"].append("market and financial data: not due (daily)")
+        else:
+            universe = (plan or {}).get("universe") or stocks
+            load_market_data(ords, token, universe, stats)
+            load_fin_data(ords, token, universe, stats, due=(plan or {}).get("items") if plan else None)
         if heads:
             message += f"Headlines not reached for {len(heads)} stocks (time budget). "
         log(f"headlines done: {stats['headlines']} read, {stats['new']} new, {len(bodies)} bodies to fetch")

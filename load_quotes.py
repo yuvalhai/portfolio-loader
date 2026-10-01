@@ -5,7 +5,10 @@ Flow:
   1. OAuth token from ORDS (client credentials, same client as the daily loader).
   2. Held symbols from the database (/loader/quote_symbols).
   3. Today's 1-minute bars from Yahoo via yfinance; the last bar is the current price.
+     From the same bars: the day's open, high, low and cumulative volume so far (current
+     trading day in America/New_York, regular session only).
   4. Send to the database (/loader/quotes). The table keeps only the latest quote per security.
+     The day fields are optional for the database: a quote without them is stored as before.
 
 Environment variables (GitHub secrets): ORDS_BASE, ORDS_CLIENT_ID, ORDS_CLIENT_SECRET
 """
@@ -22,6 +25,7 @@ ORDS_BASE = os.environ["ORDS_BASE"].rstrip("/")
 CLIENT_ID = os.environ["ORDS_CLIENT_ID"]
 CLIENT_SECRET = os.environ["ORDS_CLIENT_SECRET"]
 BATCH = 50
+SESSION_TZ = "America/New_York"
 
 
 def get_token():
@@ -50,6 +54,39 @@ def frame_for(data, symbol, batch_size):
     return data[symbol]
 
 
+def num(x, digits=6):
+    """JSON-safe float, or None for missing values."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f):
+        return None
+    return int(round(f)) if digits == 0 else round(f, digits)
+
+
+def day_ohlc(df):
+    """Open, high, low and cumulative volume of the current trading day so far, from 1-minute bars.
+
+    The day is the America/New_York date of the last bar with a close; only bars of that date count
+    (the download is regular session only). Returns a dict with the keys that have a value."""
+    bars = df.dropna(subset=["Close"])
+    if bars.empty:
+        return {}
+    idx = pd.DatetimeIndex(bars.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    ny_dates = idx.tz_convert(SESSION_TZ).date
+    bars = bars[ny_dates == ny_dates[-1]]
+    out = {
+        "day_open": num(bars["Open"].dropna().iloc[0]) if not bars["Open"].dropna().empty else None,
+        "day_high": num(bars["High"].max()),
+        "day_low": num(bars["Low"].min()),
+        "day_volume": num(bars["Volume"].sum(min_count=1), 0) if "Volume" in bars else None,
+    }
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def main():
     token = get_token()
     r = requests.get(f"{ORDS_BASE}/loader/quote_symbols",
@@ -73,7 +110,12 @@ def main():
             if math.isnan(price):
                 failed.append(sym)
                 continue
-            quotes.append({"yahoo_symbol": sym, "price": round(price, 6), "time": iso_with_colon(last.index[-1])})
+            quote = {"yahoo_symbol": sym, "price": round(price, 6), "time": iso_with_colon(last.index[-1])}
+            try:
+                quote.update(day_ohlc(df))
+            except Exception as e:  # the day fields are optional; never lose the price because of them
+                print(f"Day OHLC failed for {sym}: {e}")
+            quotes.append(quote)
 
     print(f"Quotes: {len(quotes)}; failed: {failed}")
     if not quotes:

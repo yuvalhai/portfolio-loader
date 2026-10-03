@@ -246,7 +246,7 @@ class Tv:
         if res.isError:
             raise RuntimeError(text[:300])
         data = json.loads(text)
-        return data.get("data", data) if isinstance(data, dict) else data
+        return mcp_payload(data)
 
     async def resolve(self, symbol):
         data = await self.call("search_symbols", {"query": symbol, "type_filter": "stock"})
@@ -312,6 +312,18 @@ class Tv:
         """Quarterly (fq) or annual (fy) history: labels and series (revenue, gross_profit, fcf, total_debt ...)."""
         since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
         return await self.call("get_financial_history", {"symbol": tv_symbol, "period": period, "date_from": since})
+
+
+def mcp_payload(data):
+    """Reject errors returned inside a successful MCP transport response."""
+    payload = data.get("data", data) if isinstance(data, dict) else data
+    for obj in (data, payload):
+        if isinstance(obj, dict) and (obj.get("success") is False or obj.get("error")):
+            detail = json.dumps(obj, ensure_ascii=False)[:600]
+            if re.search(r"429|rate.?limit|too many requests", detail, re.I):
+                raise RuntimeError("429: TradingView " + detail)
+            raise RuntimeError("TradingView " + detail)
+    return payload
 
 
 def batch_rows(data):
@@ -757,8 +769,11 @@ def load_fin_data(ords, token, stocks, stats, due=None):
                 res = check(ords.post("security/fin_history", h), "security/fin_history")
                 if "error" in h:
                     stats["failed"].append(f"fin history {h['id']}: {h['error'][:120]}")
-                elif res.get("failed"):   # DB moved the stock to the Issues screen and out of the queue: go on
-                    stats["notes"].append(f"fin history {h['id']} moved to Issues")
+                elif res.get("failed"):
+                    if res.get("transient"):
+                        stats["notes"].append(f"fin history {h['id']} deferred (temporary)")
+                    else:
+                        stats["notes"].append(f"fin history {h['id']} moved to Issues")
                 else:
                     stats["fin_hist"] += 1
         log(f"fin data: snapshot {stats['fin_snap']}, history {stats['fin_hist']}")

@@ -1,8 +1,5 @@
 name: Financial history diagnostic
 on:
-  push:
-    paths:
-      - .github/workflows/fin-diagnostic.yml
   workflow_dispatch:
 concurrency:
   group: news-loader
@@ -19,7 +16,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements_news.txt
-      - run: python repair_fin_history.py
+      - run: python diag_fin_history.py
         env:
           ORDS_BASE: ${{ secrets.ORDS_BASE }}
           ORDS_CLIENT_ID: ${{ secrets.ORDS_CLIENT_ID }}

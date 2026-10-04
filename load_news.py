@@ -63,9 +63,9 @@ SESSION_MAX_SEC = 12 * 60     # access token lives 15 minutes; renew before that
 US_EXCHANGES = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"]
 MD_COLUMNS = ["market_cap_basic", "fundamental_currency_code", "close", "average_volume_30d_calc", "currency"]
 # thesis financial data layer: current values (one row per stock) and history (per stock and period)
-FIN_COLUMNS = ["fundamental_currency_code", "total_revenue_ttm", "total_revenue_fy", "gross_margin_ttm",
+FIN_COLUMNS = ["fundamental_currency_code", "total_revenue_ttm", "gross_margin_ttm",
                "cash_f_operating_activities_ttm", "neg_capital_expenditures_ttm", "free_cash_flow_ttm",
-               "total_debt_fq", "cash_n_short_term_invest_fq", "effective_interest_rate_on_debt_ttm",
+               "cash_n_short_term_invest_fq", "effective_interest_rate_on_debt_ttm",
                "share_buyback_ratio_fy", "fiscal_period_end_fy"]
 FIN_HISTORY_PER_RUN = 40      # stocks per daily run whose history is fetched (2 calls each); the rest waits for the next day
 SCANNER_GAP = 3.0             # seconds between TradingView scanner calls (the scanner answers 429 when called faster)

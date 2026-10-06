@@ -2,9 +2,13 @@ name: Intraday quotes (holdings)
 
 on:
   schedule:
-    # Every 15 minutes, 13:00-21:45 UTC, Monday to Friday (covers US market hours in summer and winter)
-    - cron: "*/15 13-21 * * 1-5"
+    # UTC envelope; market_session.py enforces NYSE open minus 5.5h until close.
+    - cron: "*/15 8-20 * * 1-5"
   workflow_dispatch:
+  push:
+    paths:
+      - "load_quotes.py"
+      - ".github/workflows/intraday_quotes.yml"
 
 jobs:
   quotes:

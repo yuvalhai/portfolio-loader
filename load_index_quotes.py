@@ -1,6 +1,7 @@
 """Refresh only INDEX quotes; no research or full portfolio refresh."""
 import datetime as dt
 import math
+from zoneinfo import ZoneInfo
 import requests
 import yfinance as yf
 from load_quotes import ORDS_BASE, get_token, frame_for, iso_with_colon
@@ -12,7 +13,7 @@ def collect(rows):
     if yahoo_rows:
         symbols = [r["yahoo_symbol"] for r in yahoo_rows]
         data = yf.download(symbols, period="5d", interval="1m", group_by="ticker",
-                           auto_adjust=False, prepost=False, progress=False)
+                           auto_adjust=False, prepost=True, progress=False)
         daily = yf.download(symbols, period="5d", interval="1d", group_by="ticker",
                             auto_adjust=False, progress=False)
         for sym in symbols:
@@ -24,7 +25,8 @@ def collect(rows):
                 continue
             price, stamp = float(last.iloc[-1]), last.index[-1]
             prior = hist["Close"].dropna()
-            prior = prior[[x.date() < stamp.date() for x in prior.index]]
+            today = dt.datetime.now(ZoneInfo("UTC" if sym in ("BTC-USD", "ETH-USD") else "America/New_York")).date()
+            prior = prior[[x.date() < today for x in prior.index]]
             if prior.empty or not math.isfinite(price):
                 continue
             pct = 100 * (price / float(prior.iloc[-1]) - 1)

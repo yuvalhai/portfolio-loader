@@ -16,6 +16,7 @@ Environment variables (GitHub secrets): ORDS_BASE, ORDS_CLIENT_ID, ORDS_CLIENT_S
 import os
 import sys
 import math
+from market_session import quote_window
 
 import requests
 import pandas as pd
@@ -78,6 +79,10 @@ def day_ohlc(df):
         idx = idx.tz_localize("UTC")
     ny_dates = idx.tz_convert(SESSION_TZ).date
     bars = bars[ny_dates == ny_dates[-1]]
+    local = pd.DatetimeIndex(bars.index).tz_convert(SESSION_TZ)
+    bars = bars[(local.hour * 60 + local.minute >= 570) & (local.hour * 60 + local.minute < 960)]
+    if bars.empty:
+        return {}
     out = {
         "day_open": num(bars["Open"].dropna().iloc[0]) if not bars["Open"].dropna().empty else None,
         "day_high": num(bars["High"].max()),
@@ -88,6 +93,9 @@ def day_ohlc(df):
 
 
 def main():
+    if not quote_window():
+        print("Outside NYSE quote window; skipped")
+        return
     token = get_token()
     r = requests.get(f"{ORDS_BASE}/loader/quote_symbols",
                      headers={"Authorization": f"Bearer {token}"}, timeout=60)
@@ -99,7 +107,7 @@ def main():
     for i in range(0, len(symbols), BATCH):
         batch = symbols[i:i + BATCH]
         data = yf.download(batch, period="1d", interval="1m", group_by="ticker",
-                           auto_adjust=False, prepost=False, threads=True, progress=False)
+                           auto_adjust=False, prepost=True, threads=True, progress=False)
         for sym in batch:
             df = frame_for(data, sym, len(batch))
             if df is None or df.empty or df["Close"].dropna().empty:

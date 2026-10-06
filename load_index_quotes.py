@@ -1,6 +1,7 @@
 """Refresh only INDEX quotes; no research or full portfolio refresh."""
 import datetime as dt
 import math
+from market_session import quote_window
 from zoneinfo import ZoneInfo
 import requests
 import yfinance as yf
@@ -48,6 +49,9 @@ def collect(rows):
     return quotes
 
 def main():
+    if not quote_window():
+        print("Outside NYSE quote window; skipped")
+        return
     token = get_token()
     headers = {"Authorization": f"Bearer {token}"}
     r = requests.get(f"{ORDS_BASE}/loader/index_symbols", headers=headers, timeout=60)

@@ -1,0 +1,29 @@
+name: Index quotes (5 minutes)
+on:
+  schedule:
+    - cron: "*/5 13-21 * * 1-5"
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/index_quotes.yml"
+      - "load_index_quotes.py"
+concurrency:
+  group: index-quotes
+  cancel-in-progress: false
+jobs:
+  indices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Refresh indices only
+        env:
+          ORDS_BASE: ${{ secrets.ORDS_BASE }}
+          ORDS_CLIENT_ID: ${{ secrets.ORDS_CLIENT_ID }}
+          ORDS_CLIENT_SECRET: ${{ secrets.ORDS_CLIENT_SECRET }}
+        run: python load_index_quotes.py

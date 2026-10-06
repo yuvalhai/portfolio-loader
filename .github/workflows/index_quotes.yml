@@ -1,7 +1,7 @@
 name: Index quotes (5 minutes)
 on:
   schedule:
-    - cron: "*/5 13-21 * * 1-5"
+    - cron: "*/5 8-20 * * 1-5"
   workflow_dispatch:
   push:
     paths:

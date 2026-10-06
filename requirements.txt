@@ -1,3 +1,4 @@
 yfinance
 pandas
 requests
+pandas_market_calendars

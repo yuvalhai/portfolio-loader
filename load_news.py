@@ -607,7 +607,15 @@ async def do_head(ords, tv, s, stats, bodies):
 
 async def do_body(ords, tv, job, stats):
     t1 = time.time()
-    text = await tv.story(job.news_id)
+    try:
+        text = await tv.story(job.news_id)
+    except RuntimeError as e:
+        if re.search(r"news-mediator\S*: (404|410):", str(e)):
+            # TradingView no longer serves this story (user decision 13/10/2026): the DB discards it, never asked again
+            check(await asyncio.to_thread(ords.post, "news/body", {"news_id": job.news_id, "gone": "Y"}), "news/body")
+            stats["gone"] += 1
+            return
+        raise
     t2 = time.time()
     check(await asyncio.to_thread(ords.post, "news/body", {"news_id": job.news_id, "text": text}), "news/body")
     t3 = time.time()
@@ -838,7 +846,7 @@ def main():
     ords = Ords()
     stats = {"headlines": 0, "new": 0, "bodies": 0, "tv_filled": 0, "caps": 0, "failed": [], "t_story": 0.0,
              "t_ords": 0.0, "ai": 0, "ai_deep": 0, "ai_light": 0, "escalated": 0, "no_summary": 0,
-             "busy_skipped": 0, "notes": [], "fin_snap": 0, "fin_hist": 0}
+             "busy_skipped": 0, "notes": [], "fin_snap": 0, "fin_hist": 0, "gone": 0}
     status, message = "OK", ""
     bodies = []
     try:
@@ -868,6 +876,8 @@ def main():
         run_queue(ords, token, bodies, bodies, stats, t0 + RUN_BUDGET_SEC)
         if bodies:
             message += f"{len(bodies)} bodies left for the next run. "
+        if stats["gone"]:
+            stats["notes"].append(f"{stats['gone']} stories no longer on TradingView (404/410): discarded")
         ai_start = time.time()
         run_ai(ords, stats, ai_start + min(AI_DEEP_MAX_SEC, AI_BUDGET_SEC), "DEEP", GEMINI_MODELS_DEEP)
         run_ai(ords, stats, ai_start + AI_BUDGET_SEC, "LIGHT", GEMINI_MODELS_LIGHT)

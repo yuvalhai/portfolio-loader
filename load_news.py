@@ -13,6 +13,8 @@ Portfolio news loader (GitHub Actions).
    After the headlines, one batch call fetches market cap and 30-day average traded value for the
    stocks of this run and sends them to /loader/security/market_data (the DB converts to USD).
 4. For headlines still KEEP/REVIEW without a body: pulls the story text and runs stage 2 (body rules).
+   Each run starts with the stories of earlier runs that still have no text, of any stock (ORDS news/pending_bodies,
+   user decision 13/10/2026), so a run cut short does not leave them waiting for the stock's next rotation.
    Then (thesis financial data layer, PF_LOGIC 'Thesis evaluation - financial data layer'): one more batch
    call fetches current fundamentals for the same stocks and sends them to /loader/security/fin_snapshot;
    and for the stocks the DB lists as due (/loader/security/fin_history_due: never fetched, or a newer report
@@ -857,6 +859,14 @@ def main():
         if plan is not None and plan.get("daily_due"):
             _tv["overlap"] = OVERLAP_DAILY_SEC
             stats["notes"].append("daily run (headline overlap one day)")
+        # stories of earlier runs still without text (any stock) come first (user decision 13/10/2026)
+        try:
+            pending = [Job("BODY", {"s": p["s"]}, p["n"]) for p in ords.get("news/pending_bodies")]
+        except httpx.HTTPStatusError:
+            pending = []
+        if pending:
+            log(f"{len(pending)} stories from earlier runs still without text: fetched first")
+            run_queue(ords, token, pending, bodies, stats, t0 + HEAD_BUDGET_SEC)
         stocks = ords.get(f"news/symbols?limit={STOCKS_PER_RUN}")
         log(f"{len(stocks)} stocks, headline overlap {_tv['overlap'] // 3600}h")
         heads = [Job("HEAD", s) for s in stocks]

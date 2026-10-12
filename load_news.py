@@ -4,6 +4,12 @@ Portfolio news loader (GitHub Actions).
 2. Refreshes it and saves the new one immediately (TradingView rotates refresh tokens).
 3. For every held/watched stock: fills a missing TV_SYMBOL, pulls new headlines from the
    TradingView MCP server and loads them to PF_NEWS_INBOX (stage 1, title rules run in the DB).
+   Overlap (user decision 12/10/2026): a regular run re-reads OVERLAP_SEC (two hours) before the last known
+   headline of the stock; the daily run (daily_due from the DB) re-reads OVERLAP_DAILY_SEC (one day), to catch
+   stories TradingView publishes late.
+   Pace (user decision 12/10/2026): calls start MIN_CALL_GAP apart (80% of the earlier pace), WORKERS in flight.
+   A 429 breaks the connection: the run waits TV_429_WAIT and reconnects; a second 429 with no progress since the
+   first stops all TradingView work for this run (status PARTIAL), and the run goes on to stage 3.
    After the headlines, one batch call fetches market cap and 30-day average traded value for the
    stocks of this run and sends them to /loader/security/market_data (the DB converts to USD).
 4. For headlines still KEEP/REVIEW without a body: pulls the story text and runs stage 2 (body rules).
@@ -53,12 +59,14 @@ STOCKS_PER_RUN = 50           # rotation: each run takes the stocks scanned long
 FIRST_RUN_DAYS = 2            # look-back for a stock with no news in the DB yet
 HEAD_BUDGET_SEC = 15 * 60     # safety net only: pass 1 (headlines) must end by then
 RUN_BUDGET_SEC = 25 * 60      # safety net only: pass 2 (story bodies) stops here; the rest waits for the next run
-OVERLAP_SEC = 86400           # re-read one day before the last known headline (duplicates are ignored by the DB)
+OVERLAP_SEC = 2 * 3600        # regular run: re-read two hours before the last known headline (duplicates are ignored by the DB)
+OVERLAP_DAILY_SEC = 86400     # daily run: re-read one day before it, to catch stories published late
 PAGE = 25
 MAX_HEADLINES = 200
-MIN_CALL_GAP = 0.7            # TradingView limit is ~100 calls/minute
+MIN_CALL_GAP = 0.875          # ~68 calls/minute, 80% of the earlier pace (0.7), after 429 blocks (user decision 12/10/2026)
 WORKERS = 6                   # TradingView calls in flight at the same time
-MAX_RECONNECTS = 5            # a broken TradingView connection is reopened this many times per run
+MAX_RECONNECTS = 5            # a broken TradingView connection (not 429) is reopened this many times per run
+TV_429_WAIT = 60              # a 429: wait this long before reconnecting; a second 429 with no progress stops TradingView for the run
 SESSION_MAX_SEC = 12 * 60     # access token lives 15 minutes; renew before that
 US_EXCHANGES = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"]
 MD_COLUMNS = ["market_cap_basic", "fundamental_currency_code", "close", "average_volume_30d_calc", "currency"]
@@ -72,6 +80,7 @@ SCANNER_GAP = 3.0             # seconds between TradingView scanner calls (the s
 SCANNER_429_WAIT = 60         # a 429 from the scanner: wait this long and retry once
 SCANNER_TOOLS = ("get_symbol_data_batch", "get_financial_history")
 _scan = {"last": 0.0, "blocked": False}   # shared by all Tv sessions of the run
+_tv = {"blocked": False, "overlap": OVERLAP_SEC}   # blocked: a repeated 429 stopped TradingView work for this run
 FIN_HISTORY_QUARTERS_DAYS = 800   # look-back for quarterly history (8+ quarters)
 FIN_HISTORY_YEARS_DAYS = 1500     # look-back for annual history (3+ fiscal years)
 
@@ -196,6 +205,10 @@ def norm(s):
     return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
 
 
+def is_429(e):
+    return bool(re.search(r"429|too many requests", leaf_errors(e), re.I))
+
+
 class Tv:
     def __init__(self, session: ClientSession, tools):
         self.session = session
@@ -256,7 +269,7 @@ class Tv:
         return cands[0]["symbol"] if cands else None
 
     async def headlines(self, tv_symbol, since):
-        cutoff = (since - OVERLAP_SEC) if since else (time.time() - FIRST_RUN_DAYS * 86400)
+        cutoff = (since - _tv["overlap"]) if since else (time.time() - FIRST_RUN_DAYS * 86400)
         out, offset = [], 0
         while offset < MAX_HEADLINES:
             data = await self.call("get_news", {"symbol": tv_symbol, "limit": PAGE, "offset": offset})
@@ -606,7 +619,8 @@ async def do_body(ords, tv, job, stats):
 
 
 async def process(ords, token, queue, bodies, stats, deadline):
-    """Works through the queue; returns when done, out of time, or when the access token needs renewal."""
+    """Works through the queue; returns when done, out of time, or when the access token needs renewal.
+    A job cut off by a 429 or by a broken connection goes back to the front of the queue."""
     headers = {"Authorization": f"Bearer {token.access_token}"}
     async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(60, read=300)) as client:
         async with streamable_http_client(TV_MCP_URL, http_client=client) as streams:
@@ -624,7 +638,13 @@ async def process(ords, token, queue, bodies, stats, deadline):
                                 await do_head(ords, tv, job.stock, stats, bodies)
                             else:
                                 await do_body(ords, tv, job, stats)
+                        except asyncio.CancelledError:
+                            queue.insert(0, job)   # the connection went down while this job was in flight
+                            raise
                         except Exception as e:
+                            if is_429(e):
+                                queue.insert(0, job)   # not done: retried after the wait in run_queue
+                                raise
                             what = job.stock["s"] + (f" body {job.news_id}" if job.news_id else "")
                             stats["failed"].append(f"{what}: {str(e)[:200]}")
 
@@ -640,16 +660,31 @@ def leaf_errors(e):
 
 
 def run_queue(ords, token, queue, bodies, stats, deadline):
-    """Runs the queue; when the TradingView connection breaks, reconnects and continues (up to MAX_RECONNECTS)."""
+    """Runs the queue. A 429: wait TV_429_WAIT and reconnect; a second 429 with no progress since the first
+    stops TradingView work for the rest of the run. Any other broken connection: reconnect after 10 s,
+    up to MAX_RECONNECTS times."""
     breaks = 0
-    while queue and time.time() < deadline:
+    left_at_429 = None    # queue length at the previous 429
+    while queue and time.time() < deadline and not _tv["blocked"]:
         if token.expiring():
             token.refresh()
         try:
             asyncio.run(process(ords, token, queue, bodies, stats, deadline))
         except Exception as e:
-            breaks += 1
             err = leaf_errors(e)
+            if is_429(e):
+                if left_at_429 is not None and len(queue) >= left_at_429:
+                    _tv["blocked"] = True
+                    stats["failed"].append(f"TradingView 429 again after a {TV_429_WAIT}s wait: "
+                                           f"TradingView stopped for this run, {len(queue)} jobs wait for the next run")
+                    log(f"TradingView 429 again with no progress - TradingView stopped for this run")
+                    return
+                left_at_429 = len(queue)
+                stats["failed"].append(f"TradingView 429: waited {TV_429_WAIT}s ({len(queue)} jobs left)")
+                log(f"TradingView 429: waiting {TV_429_WAIT}s before reconnecting")
+                time.sleep(TV_429_WAIT)
+                continue
+            breaks += 1
             log(f"TradingView connection broke ({breaks}): {err}")
             stats["failed"].append(f"connection break: {err}")
             if breaks >= MAX_RECONNECTS:
@@ -809,19 +844,26 @@ def main():
     try:
         token = TvToken(ords)
         token.refresh()
+        # the daily plan is read before the headlines: the daily run re-reads a full day of headlines
+        plan = fin_plan(ords)
+        if plan is not None and plan.get("daily_due"):
+            _tv["overlap"] = OVERLAP_DAILY_SEC
+            stats["notes"].append("daily run (headline overlap one day)")
         stocks = ords.get(f"news/symbols?limit={STOCKS_PER_RUN}")
-        log(f"{len(stocks)} stocks")
+        log(f"{len(stocks)} stocks, headline overlap {_tv['overlap'] // 3600}h")
         heads = [Job("HEAD", s) for s in stocks]
         run_queue(ords, token, heads, bodies, stats, t0 + HEAD_BUDGET_SEC)
-        plan = fin_plan(ords)
-        if plan is not None and plan.get("daily_due") is False:
+        if _tv["blocked"]:
+            stats["notes"].append("market and financial data: skipped (TradingView 429)")
+        elif plan is not None and plan.get("daily_due") is False:
             stats["notes"].append("market and financial data: not due (daily)")
         else:
             universe = (plan or {}).get("universe") or stocks
             load_market_data(ords, token, universe, stats)
             load_fin_data(ords, token, universe, stats, due=(plan or {}).get("items") if plan else None)
         if heads:
-            message += f"Headlines not reached for {len(heads)} stocks (time budget). "
+            why = "TradingView 429" if _tv["blocked"] else "time budget"
+            message += f"Headlines not reached for {len(heads)} stocks ({why}). "
         log(f"headlines done: {stats['headlines']} read, {stats['new']} new, {len(bodies)} bodies to fetch")
         run_queue(ords, token, bodies, bodies, stats, t0 + RUN_BUDGET_SEC)
         if bodies:

@@ -7,9 +7,10 @@ Portfolio news loader (GitHub Actions).
    Overlap (user decision 12/10/2026): a regular run re-reads OVERLAP_SEC (two hours) before the last known
    headline of the stock; the daily run (daily_due from the DB) re-reads OVERLAP_DAILY_SEC (one day), to catch
    stories TradingView publishes late.
-   Pace (user decision 12/10/2026): calls start MIN_CALL_GAP apart (80% of the earlier pace), WORKERS in flight.
-   A 429 breaks the connection: the run waits TV_429_WAIT and reconnects; a second 429 with no progress since the
-   first stops all TradingView work for this run (status PARTIAL), and the run goes on to stage 3.
+   Pace (user decision 13/10/2026): calls start MIN_CALL_GAP apart (70% of the earlier pace), WORKERS in flight.
+   A 429 breaks the connection: the run waits TV_429_WAIT and reconnects. That wait is a note, not a failure, and
+   does not make the run PARTIAL (user decision 13/10/2026). A second 429 with no progress since the first stops
+   all TradingView work for this run (a failure: status PARTIAL), and the run goes on to stage 3.
    After the headlines, one batch call fetches market cap and 30-day average traded value for the
    stocks of this run and sends them to /loader/security/market_data (the DB converts to USD).
 4. For headlines still KEEP/REVIEW without a body: pulls the story text and runs stage 2 (body rules).
@@ -65,7 +66,7 @@ OVERLAP_SEC = 2 * 3600        # regular run: re-read two hours before the last k
 OVERLAP_DAILY_SEC = 86400     # daily run: re-read one day before it, to catch stories published late
 PAGE = 25
 MAX_HEADLINES = 200
-MIN_CALL_GAP = 0.875          # ~68 calls/minute, 80% of the earlier pace (0.7), after 429 blocks (user decision 12/10/2026)
+MIN_CALL_GAP = 1.0            # 60 calls/minute, 70% of the earlier pace (0.7); was 80% (0.875) on 12/10 (user decision 13/10/2026)
 WORKERS = 6                   # TradingView calls in flight at the same time
 MAX_RECONNECTS = 5            # a broken TradingView connection (not 429) is reopened this many times per run
 TV_429_WAIT = 60              # a 429: wait this long before reconnecting; a second 429 with no progress stops TradingView for the run
@@ -690,7 +691,8 @@ def run_queue(ords, token, queue, bodies, stats, deadline):
                     log(f"TradingView 429 again with no progress - TradingView stopped for this run")
                     return
                 left_at_429 = len(queue)
-                stats["failed"].append(f"TradingView 429: waited {TV_429_WAIT}s ({len(queue)} jobs left)")
+                # a single 429 followed by a wait is not a failure (user decision 13/10/2026): a note only
+                stats["notes"].append(f"TradingView 429: waited {TV_429_WAIT}s ({len(queue)} jobs left)")
                 log(f"TradingView 429: waiting {TV_429_WAIT}s before reconnecting")
                 time.sleep(TV_429_WAIT)
                 continue

@@ -1,8 +1,6 @@
 name: ARK combined
 
 on:
-  schedule:
-    - cron: "30 5 * * *"   # every day 05:30 UTC
   workflow_dispatch:
 
 jobs:

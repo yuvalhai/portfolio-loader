@@ -1,8 +1,6 @@
 name: News loader
 
 on:
-  schedule:
-    - cron: "17 */2 * * *"   # every 2 hours (UTC)
   workflow_dispatch:
 
 # never two runs at once: each run rotates the TradingView refresh token

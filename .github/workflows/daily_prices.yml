@@ -1,9 +1,6 @@
 name: Daily prices and FX
 
 on:
-  schedule:
-    # 22:30 UTC, Monday to Friday (after the US close)
-    - cron: "30 22 * * 1-5"
   workflow_dispatch:
     inputs:
       history_period:

@@ -1,9 +1,6 @@
 name: Intraday quotes (holdings)
 
 on:
-  schedule:
-    # UTC envelope; market_session.py enforces NYSE open minus 5.5h until close.
-    - cron: "*/15 8-20 * * 1-5"
   workflow_dispatch:
   push:
     paths:

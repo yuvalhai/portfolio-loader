@@ -10,6 +10,11 @@ Flow:
   6. For securities whose name did not come from Yahoo yet, read the name
      from Yahoo and send it (/loader/names). Names always come from Yahoo.
 
+A run during a trading session (for example the "load prices" button on the
+Issues page) never saves the bar of a session that has not closed yet: Yahoo
+returns the intraday price as that day's bar, and a saved bar makes the system
+treat the day as closed (no live change on the Home and Allocation pages).
+
 Environment variables (set as GitHub secrets):
   ORDS_BASE            e.g. https://<host>/ords/portfolio
   ORDS_CLIENT_ID
@@ -25,6 +30,7 @@ import sys
 import math
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 import pandas as pd
@@ -40,6 +46,19 @@ DOWNLOAD_BATCH = 50      # tickers per yfinance download call
 POST_CHUNK_ROWS = 5000   # price rows per POST to the database
 BOI_URL = "https://boi.org.il/PublicApi/GetExchangeRates"
 FX_CURRENCIES = {"USD", "GBP", "EUR"}
+
+# Local session close (with a small margin) by Yahoo suffix; anything else is US.
+SESSION_CLOSE = {".TA": ("Asia/Jerusalem", 17, 45), ".L": ("Europe/London", 16, 45)}
+US_CLOSE = ("America/New_York", 16, 15)
+
+
+def open_session_date(symbol):
+    """Local date of a session still open for this symbol, or None when today's session has closed."""
+    tz, hh, mm = next((v for k, v in SESSION_CLOSE.items() if symbol.endswith(k)), US_CLOSE)
+    now = datetime.now(ZoneInfo(tz))
+    if now.hour * 60 + now.minute < hh * 60 + mm:
+        return now.strftime("%Y-%m-%d")
+    return None
 
 
 def get_token():
@@ -101,6 +120,7 @@ def frame_for(data, symbol, batch_size):
 
 def download_prices(symbols, period):
     rows, failed = [], []
+    skipped_open = 0
     for i in range(0, len(symbols), DOWNLOAD_BATCH):
         batch = symbols[i:i + DOWNLOAD_BATCH]
         data = yf.download(
@@ -119,10 +139,15 @@ def download_prices(symbols, period):
                 continue
             df = df.dropna(subset=["Close"]).copy()
             df["Prev_Close"] = df["Close"].shift(1)
+            open_date = open_session_date(sym)
             for dt, rec in df.iterrows():
+                d = pd.Timestamp(dt).strftime("%Y-%m-%d")
+                if open_date and d >= open_date:
+                    skipped_open += 1
+                    continue
                 rows.append({
                     "yahoo_symbol": sym,
-                    "date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
+                    "date": d,
                     "open": num(rec.get("Open")),
                     "high": num(rec.get("High")),
                     "low": num(rec.get("Low")),
@@ -131,6 +156,8 @@ def download_prices(symbols, period):
                     "volume": num(rec.get("Volume")),
                 })
         time.sleep(1)
+    if skipped_open:
+        print(f"Skipped {skipped_open} bars of sessions still open")
     return rows, failed
 
 

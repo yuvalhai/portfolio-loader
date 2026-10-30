@@ -107,7 +107,7 @@ AI_WORKERS = 4                # items asked at once; AI_CALL_GAP still spaces th
 AI_BUSY_PAUSE_SEC = 30        # all models of a tier busy on an item -> skip it and wait this long
 AI_BUSY_STOP = 3              # ...and stop the tier after this many such items in a row
 AI_CALL_GAP = 4.5             # stay well under the free-tier requests-per-minute limit
-DECISIONS = {"NEW_CATALYST", "CONFIRMS", "REFUTES", "STANDALONE", "ANALYST", "DISCARD", "ASK"}
+DECISIONS = {"NEW_CATALYST", "CONFIRMS", "REFUTES", "STANDALONE", "ANALYST", "DISCARD", "ASK", "NO_NEW"}  # NO_NEW: 30/10/2026 (in the prompt since 20/10/2026)
 
 
 def log(msg):
@@ -449,7 +449,8 @@ class Gemini:
         if isinstance(res, list):
             res = res[0]
         if str(res.get("decision", "")).upper() not in DECISIONS:
-            raise RuntimeError(f"bad decision: {text[:200]}")
+            # 30/10/2026: name the value first; the text starts with body_he and hid it
+            raise RuntimeError(f"bad decision {str(res.get('decision'))[:40]!r}: {text[:200]}")
         # the auditor reads this instead of the story, so it must be there and must fit the column
         res["body_he"] = (res.get("body_he") or "")[:2400]
         return res

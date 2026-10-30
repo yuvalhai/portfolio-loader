@@ -66,9 +66,11 @@ OVERLAP_SEC = 2 * 3600        # regular run: re-read two hours before the last k
 OVERLAP_DAILY_SEC = 86400     # daily run: re-read one day before it, to catch stories published late
 PAGE = 25
 MAX_HEADLINES = 200
-MIN_CALL_GAP = 1.0            # 60 calls/minute, 70% of the earlier pace (0.7); was 80% (0.875) on 12/10 (user decision 13/10/2026)
+MIN_CALL_GAP = 1.2            # 50 calls/minute (user decision 30/10/2026, TradingView suspends MCP access); was 1.0 from 13/10, 0.875 on 12/10, 0.7 before
 WORKERS = 6                   # TradingView calls in flight at the same time
 MAX_RECONNECTS = 5            # a broken TradingView connection (not 429) is reopened this many times per run
+TOKEN_SAVE_WAITS = [0, 5, 15, 30, 60]          # saving a rotated refresh token: tries and waits (about 2 minutes)
+TOKEN_SAVE_END_WAITS = [0, 30, 60, 120, 180]   # the last tries at the end of the run (about 6 minutes)
 TV_429_WAIT = 60              # a 429: wait this long before reconnecting; a second 429 with no progress stops TradingView for the run
 SESSION_MAX_SEC = 12 * 60     # access token lives 15 minutes; renew before that
 US_EXCHANGES = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"]
@@ -155,6 +157,7 @@ class TvToken:
         self.refresh_token = row["refresh_token"]
         self.access_token = None
         self.issued = 0.0
+        self.unsaved = False   # 30/10/2026: a rotated refresh token that the DB did not accept yet
 
     def refresh(self):
         form = {"grant_type": "refresh_token", "refresh_token": self.refresh_token,
@@ -172,10 +175,32 @@ class TvToken:
         if new_rt and new_rt != self.refresh_token:
             self.refresh_token = new_rt
         # save at once: the old refresh token is no longer valid
-        res = self.ords.post("oauth_token", {"provider": PROVIDER, "refresh_token": self.refresh_token})
-        if res.get("status") != "OK":
-            raise SystemExit(f"Could not save the new refresh token: {res}")
-        log("TradingView token refreshed and saved")
+        if self.save(TOKEN_SAVE_WAITS):
+            log("TradingView token refreshed and saved")
+        else:
+            # 30/10/2026 (user): the run goes on with the token in memory and tries again at the end of the run.
+            # Stopping here lost the only valid refresh token (08/10, 30/10: a DB error 572 on the save).
+            self.unsaved = True
+            log("TradingView token refreshed but NOT saved yet - will try again at the end of the run")
+
+    def save(self, waits):
+        """Saves the refresh token in the DB, trying again after each wait (seconds). True when saved."""
+        last = None
+        for i, w in enumerate(waits):
+            if w:
+                time.sleep(w)
+            try:
+                res = self.ords.post("oauth_token", {"provider": PROVIDER, "refresh_token": self.refresh_token})
+                if isinstance(res, dict) and res.get("status") == "OK":
+                    self.unsaved = False
+                    if i:
+                        log(f"refresh token saved on attempt {i + 1}")
+                    return True
+                last = res
+            except Exception as e:
+                last = leaf_errors(e)
+            log(f"refresh token save failed (attempt {i + 1}): {str(last)[:200]}")
+        return False
 
     def expiring(self):
         return time.time() - self.issued > SESSION_MAX_SEC
@@ -866,6 +891,7 @@ def main():
              "busy_skipped": 0, "notes": [], "fin_snap": 0, "fin_hist": 0, "gone": 0}
     status, message = "OK", ""
     bodies = []
+    token = None
     try:
         token = TvToken(ords)
         token.refresh()
@@ -912,6 +938,11 @@ def main():
         status, message = "ERROR", str(e)
     except Exception as e:
         status, message = "ERROR", leaf_errors(e)[:500]
+    # 30/10/2026: a rotated refresh token not saved yet gets its last tries; losing it needs a manual reconnect
+    if token is not None and token.unsaved and not token.save(TOKEN_SAVE_END_WAITS):
+        status = "ERROR"
+        message = ("The new TradingView refresh token could not be saved in the DB; reconnect TradingView. "
+                   + message)
     if status == "OK" and stats["failed"]:
         status = "PARTIAL"
     n = max(stats["bodies"], 1)

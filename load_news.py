@@ -83,7 +83,10 @@ SCANNER_GAP = 3.0             # seconds between TradingView scanner calls (the s
 SCANNER_429_WAIT = 60         # a 429 from the scanner: wait this long and retry once
 SCANNER_TOOLS = ("get_symbol_data_batch", "get_financial_history")
 _scan = {"last": 0.0, "blocked": False}   # shared by all Tv sessions of the run
-_tv = {"blocked": False, "overlap": OVERLAP_SEC}   # blocked: a repeated 429 stopped TradingView work for this run
+_tv = {"blocked": False, "overlap": OVERLAP_SEC, "why": "TradingView 429"}   # blocked: a repeated 429 stopped TradingView work for this run
+# 30/10/2026 (user): TradingView suspends the account's MCP access (TOOL_QUOTA_EXCEEDED, "until 00:00 UTC").
+# The first such answer stops all TradingView calls for the rest of the run, instead of failing every job.
+TV_SUSPENDED = "TOOL_QUOTA_EXCEEDED"
 FIN_HISTORY_QUARTERS_DAYS = 800   # look-back for quarterly history (8+ quarters)
 FIN_HISTORY_YEARS_DAYS = 1500     # look-back for annual history (3+ fiscal years)
 
@@ -642,7 +645,7 @@ async def process(ords, token, queue, bodies, stats, deadline):
 
                 async def worker():
                     while queue:
-                        if token.expiring() or time.time() > deadline:
+                        if token.expiring() or time.time() > deadline or _tv["blocked"]:
                             return
                         job = queue.pop(0)
                         try:
@@ -657,6 +660,15 @@ async def process(ords, token, queue, bodies, stats, deadline):
                             if is_429(e):
                                 queue.insert(0, job)   # not done: retried after the wait in run_queue
                                 raise
+                            if TV_SUSPENDED in str(e):
+                                queue.insert(0, job)   # not done: waits for the next run
+                                if not _tv["blocked"]:
+                                    _tv["blocked"] = True
+                                    _tv["why"] = "TradingView suspended MCP access"
+                                    stats["failed"].append(f"TradingView suspended MCP access: TradingView stopped for "
+                                                           f"this run, {len(queue)} jobs wait. {str(e)[:200]}")
+                                    log("TradingView suspended MCP access - TradingView stopped for this run")
+                                return
                             what = job.stock["s"] + (f" body {job.news_id}" if job.news_id else "")
                             stats["failed"].append(f"{what}: {str(e)[:200]}")
 
@@ -875,7 +887,7 @@ def main():
         heads = [Job("HEAD", s) for s in stocks]
         run_queue(ords, token, heads, bodies, stats, t0 + HEAD_BUDGET_SEC)
         if _tv["blocked"]:
-            stats["notes"].append("market and financial data: skipped (TradingView 429)")
+            stats["notes"].append(f"market and financial data: skipped ({_tv['why']})")
         elif plan is not None and plan.get("daily_due") is False:
             stats["notes"].append("market and financial data: not due (daily)")
         else:
@@ -883,7 +895,7 @@ def main():
             load_market_data(ords, token, universe, stats)
             load_fin_data(ords, token, universe, stats, due=(plan or {}).get("items") if plan else None)
         if heads:
-            why = "TradingView 429" if _tv["blocked"] else "time budget"
+            why = _tv["why"] if _tv["blocked"] else "time budget"
             message += f"Headlines not reached for {len(heads)} stocks ({why}). "
         log(f"headlines done: {stats['headlines']} read, {stats['new']} new, {len(bodies)} bodies to fetch")
         run_queue(ords, token, bodies, bodies, stats, t0 + RUN_BUDGET_SEC)

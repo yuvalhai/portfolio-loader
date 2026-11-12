@@ -10,13 +10,19 @@ Flow:
   4. Send to the database (/loader/quotes). The table keeps only the latest quote per security.
      The day fields are optional for the database: a quote without them is stored as before.
 
+Post-close run (12/11/2026, user): the window stays open AFTER_CLOSE_MIN minutes after the NYSE
+close. In that run the price is the regular-session close (Yahoo daily bar of the session date,
+else the last 1-minute bar before the close), never an after-hours bar, and the quote time is the
+close. So the live change in the evening equals the nightly snapshot.
+
 Environment variables (GitHub secrets): ORDS_BASE, ORDS_CLIENT_ID, ORDS_CLIENT_SECRET
 """
 
 import os
 import sys
 import math
-from market_session import quote_window
+import datetime as dt
+from market_session import quote_window, session_close
 
 import requests
 import pandas as pd
@@ -27,6 +33,7 @@ CLIENT_ID = os.environ["ORDS_CLIENT_ID"]
 CLIENT_SECRET = os.environ["ORDS_CLIENT_SECRET"]
 BATCH = 50
 SESSION_TZ = "America/New_York"
+AFTER_CLOSE_MIN = 20
 
 
 def get_token():
@@ -92,10 +99,39 @@ def day_ohlc(df):
     return {k: v for k, v in out.items() if v is not None}
 
 
+def before_close(series, close_ts):
+    """The part of a bar series strictly before the session close (regular session, no after-hours)."""
+    idx = pd.DatetimeIndex(series.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    return series[idx < pd.Timestamp(close_ts)]
+
+
+def daily_close(daily, sym, batch_size, close_ts):
+    """Close of the session date from the Yahoo daily bar, or None."""
+    df = frame_for(daily, sym, batch_size)
+    if df is None or df.empty or "Close" not in df:
+        return None
+    c = df["Close"].dropna()
+    if c.empty:
+        return None
+    session_day = pd.Timestamp(close_ts).tz_convert(SESSION_TZ).date()
+    last_day = pd.Timestamp(c.index[-1]).date()
+    if last_day != session_day:
+        return None
+    v = num(c.iloc[-1])
+    return v if v and v > 0 else None
+
+
 def main():
-    if not quote_window():
+    if not quote_window(after_close_min=AFTER_CLOSE_MIN):
         print("Outside NYSE quote window; skipped")
         return
+    close_ts = session_close()
+    after_close = close_ts is not None and dt.datetime.now(dt.timezone.utc) >= close_ts
+    if after_close:
+        print(f"Post-close run: regular-session close of {close_ts.isoformat()}")
+
     token = get_token()
     r = requests.get(f"{ORDS_BASE}/loader/quote_symbols",
                      headers={"Authorization": f"Bearer {token}"}, timeout=60)
@@ -108,17 +144,35 @@ def main():
         batch = symbols[i:i + BATCH]
         data = yf.download(batch, period="1d", interval="1m", group_by="ticker",
                            auto_adjust=False, prepost=True, threads=True, progress=False)
+        daily = None
+        if after_close:
+            try:
+                daily = yf.download(batch, period="5d", interval="1d", group_by="ticker",
+                                    auto_adjust=False, threads=True, progress=False)
+            except Exception as e:  # fall back to the last 1-minute bar before the close
+                print(f"Daily bars failed: {e}")
         for sym in batch:
             df = frame_for(data, sym, len(batch))
             if df is None or df.empty or df["Close"].dropna().empty:
                 failed.append(sym)
                 continue
             last = df["Close"].dropna()
-            price = float(last.iloc[-1])
-            if math.isnan(price):
+            if after_close:
+                price = daily_close(daily, sym, len(batch), close_ts)
+                if price is None:
+                    reg = before_close(last, close_ts)
+                    if reg.empty:
+                        failed.append(sym)
+                        continue
+                    price = float(reg.iloc[-1])
+                qtime = close_ts
+            else:
+                price = float(last.iloc[-1])
+                qtime = last.index[-1]
+            if price is None or math.isnan(price):
                 failed.append(sym)
                 continue
-            quote = {"yahoo_symbol": sym, "price": round(price, 6), "time": iso_with_colon(last.index[-1])}
+            quote = {"yahoo_symbol": sym, "price": round(price, 6), "time": iso_with_colon(qtime)}
             try:
                 quote.update(day_ohlc(df))
             except Exception as e:  # the day fields are optional; never lose the price because of them

@@ -6,7 +6,12 @@ Flow:
   2. Read the list of Yahoo symbols from the database (/loader/symbols).
   3. Download daily prices from Yahoo via yfinance, in batches.
   4. Send prices to the database (/loader/prices), in chunks.
-  5. Read Bank of Israel representative rates and send them (/loader/fx).
+  5. Read Bank of Israel representative rates and send them (/loader/fx): today's rates,
+     plus the last FX_BACKFILL_DAYS days from the BOI series database, so a night
+     when BOI did not answer is filled on the next night. /loader/fx is always
+     called, also when BOI cannot be read (rates empty, "error" set), because the
+     nightly maintenance in the database (ATR, recommendation expiry, MI and RS
+     requests) runs in that call.
   6. For securities whose name did not come from Yahoo yet, read the name
      from Yahoo and send it (/loader/names). Names always come from Yahoo.
 
@@ -26,10 +31,12 @@ Environment variables (set as GitHub secrets):
 """
 
 import os
+import io
+import csv
 import sys
 import math
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -45,7 +52,9 @@ FULL_HISTORY_PERIOD = "3y"
 DOWNLOAD_BATCH = 50      # tickers per yfinance download call
 POST_CHUNK_ROWS = 5000   # price rows per POST to the database
 BOI_URL = "https://boi.org.il/PublicApi/GetExchangeRates"
+BOI_SERIES_URL = "https://edge.boi.gov.il/FusionEdgeServer/sdmx/v2/data/dataflow/BOI.STATISTICS/EXR/1.0/"
 FX_CURRENCIES = {"USD", "GBP", "EUR"}
+FX_BACKFILL_DAYS = 10
 
 # Local session close (with a small margin) by Yahoo suffix; anything else is US.
 SESSION_CLOSE = {".TA": ("Asia/Jerusalem", 17, 45), ".L": ("Europe/London", 16, 45)}
@@ -161,7 +170,8 @@ def download_prices(symbols, period):
     return rows, failed
 
 
-def load_fx(token):
+def boi_current():
+    """Today's representative rates from the BOI public API."""
     r = requests.get(BOI_URL, timeout=30)
     r.raise_for_status()
     rates = []
@@ -174,7 +184,50 @@ def load_fx(token):
             "date": rate_date,
             "rate_to_ils": item["currentExchangeRate"] / item["unit"],
         })
-    return api_post(token, "fx", {"source": "BOI", "rates": rates})
+    return rates
+
+
+def boi_history(days=FX_BACKFILL_DAYS):
+    """Representative rates of the last days from the BOI series database (CSV), to fill missed nights."""
+    end = datetime.now(ZoneInfo("Asia/Jerusalem")).date()
+    start = end - timedelta(days=days)
+    series = ",".join(f"RER_{c}_ILS" for c in sorted(FX_CURRENCIES))
+    r = requests.get(f"{BOI_SERIES_URL}{series}",
+                     params={"startperiod": start.isoformat(), "endperiod": end.isoformat(), "format": "csv"},
+                     timeout=60)
+    r.raise_for_status()
+    rates = []
+    reader = csv.DictReader(io.StringIO(r.content.decode("utf-8-sig")))
+    for row in reader:
+        code = row.get("SERIES_CODE") or next((v for v in row.values() if isinstance(v, str) and v.startswith("RER_")), "")
+        cur = code[4:7] if code.startswith("RER_") else ""
+        day = (row.get("TIME_PERIOD") or "")[:10]
+        val = num(row.get("OBS_VALUE"))
+        if cur in FX_CURRENCIES and len(day) == 10 and val:
+            rates.append({"currency": cur, "date": day, "rate_to_ils": val})
+    if not rates:  # a format change must show as an FX error, not as a quiet empty backfill
+        raise ValueError(f"no rates parsed from the series CSV; columns: {reader.fieldnames}")
+    return rates
+
+
+def load_fx(token):
+    """Send BOI rates to the database. Always calls /loader/fx (the nightly maintenance runs there), never raises."""
+    by_key, errors = {}, []
+    for name, fetch in (("history", boi_history), ("current", boi_current)):
+        try:
+            for rate in fetch():  # current comes last and wins for the same day
+                by_key[(rate["currency"], rate["date"])] = rate
+        except Exception as e:  # BOI down, timeout, format change
+            errors.append(f"BOI {name}: {e}"[:500])
+            print(f"FX {name} failed: {e}")
+    payload = {"source": "BOI", "rates": list(by_key.values())}
+    if errors:
+        payload["error"] = "; ".join(errors)
+    try:
+        return api_post(token, "fx", payload)
+    except Exception as e:
+        print(f"FX post failed: {e}")
+        return {"status": "ERROR", "error": str(e)}
 
 
 def fetch_names(symbols):
@@ -217,6 +270,8 @@ def main():
     if not rows:
         api_post(token, "prices", {"source": "yfinance", "prices": [], "failed": failed})
         print("No prices downloaded.")
+        token = get_token()
+        print("FX:", load_fx(token))  # the nightly maintenance still runs
         sys.exit(1)
 
     for i in range(0, len(rows), POST_CHUNK_ROWS):
@@ -229,6 +284,7 @@ def main():
         })
         print(f"Posted {len(chunk)} rows: {res}")
 
+    token = get_token()  # the price step may have taken long
     print("FX:", load_fx(token))
 
     if need_name:
